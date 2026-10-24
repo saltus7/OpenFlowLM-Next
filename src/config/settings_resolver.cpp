@@ -4,18 +4,33 @@ namespace utils { std::string getenv_oflm(const char* oflm_name); }
 #include <cstdlib>
 #include <iostream>
 
+#ifdef _WIN32
+// MSVC's <stdlib.h> provides the environment via _environ (char***) and also
+// defines a function-like macro environ -> (*__p__environ()). A plain variable
+// declaration here would collide with that macro, so the Windows path skips
+// the declaration and reads *_environ directly (see raw_environ()).
+#else
 // POSIX: the environment block. Declared at global scope, so it is not
 // resolved inside the oflm::config namespace.
 extern char** environ;
+#endif
 
 namespace oflm::config {
 
 std::set<std::string> g_external_env_vars;
 
+static char** raw_environ() {
+#ifdef _WIN32
+    return _environ;
+#else
+    return environ;
+#endif
+}
+
 void capture_external_env_vars() {
     // The environment as it was before we wrote anything into it. Anything
     // named OFLM_* that is here now is the user's.
-    for (char** e = ::environ; e && *e; ++e) {
+    for (char** e = raw_environ(); e && *e; ++e) {
         std::string entry(*e);
         size_t eq = entry.find('=');
         if (eq == std::string::npos) continue;

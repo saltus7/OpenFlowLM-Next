@@ -679,11 +679,15 @@ if(WIN32)
 endif()
 
 if(WIN32 AND NOT VCPKG_TOOLCHAIN)
-    # Bare CI runner: statically link the standalone Boost + curl.
+    # Bare Windows build. Conda-forge ships Boost and curl as DLL builds;
+    # program_options exports data symbols (boost::program_options::detail::arg,
+    # options_description::m_default_line_length) that only resolve through
+    # dllimport, so BOOST_ALL_STATIC_LINK leaves them unresolved at link time.
+    # CURL_STATICLIB mis-declares libcurl for the same reason (harmless today
+    # because no curl data symbols are referenced, but wrong).
     target_compile_definitions(oflm PUBLIC
-        CURL_STATICLIB
         BOOST_ALL_NO_LIB
-        BOOST_ALL_STATIC_LINK
+        BOOST_ALL_DYN_LINK
     )
 endif()
 

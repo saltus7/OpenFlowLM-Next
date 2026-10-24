@@ -1,0 +1,31 @@
+{
+  "version": 8,
+  "include": ["CMakePresets.json"],
+  "configurePresets": [
+    {
+      "name": "windows-vs18",
+      "inherits": "windows-default",
+      "generator": "Visual Studio 18 2026",
+      "binaryDir": "build-vs18",
+      "displayName": "Windows VS 2026 (engine only)",
+      "cacheVariables": {
+        "CURL_INCLUDE_DIR": "C:/Users/user/miniforge3/Library/include",
+        "CURL_LIBRARY":     "C:/Users/user/miniforge3/Library/lib/libcurl.lib",
+        "XRT_INCLUDE_DIR":  "C:/Xilinx/XRT/include",
+        "XRT_LIB_DIR":      "C:/Xilinx/XRT/lib"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-vs18",
+      "configurePreset": "windows-vs18",
+      "configuration": "Release",
+      "jobs": 4,
+      "environment": {
+        "CL":  "/I\"C:/Users/user/miniforge3/Library/include\"",
+        "LIB": "C:/Users/user/miniforge3/Library/lib"
+      }
+    }
+  ]
+}
