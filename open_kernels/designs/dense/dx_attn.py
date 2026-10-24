@@ -170,23 +170,42 @@ def dx_attn(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, 
     f_v = ef("attn_v", ATTN / "attn_v.cc", [u8_a] + bz + [brow, i32], ATTN_FLAGS)
     f_init = ef("attn_init", ATTN / "attn_init.cc", [foacc, fml], ATTN_FLAGS)
     h0_arg = [i32] if ACORES > 1 else []
-    # attn_step / attn_stepb read the CACHED KV rows through the `ain` fifo, whose
-    # elements are u8_a (uint8[E_A] = 1024 B for Nanbeige -- sized for the widest
-    # element the pipeline carries, the fp32 q/k/v projections). Even under q8/q4_1
-    # the packed KV row is only the first 544 B of that 1024-byte element, so the
-    # declared arg type stays u8_a: the C++ `kvout_t *` reads kKVHeadBytes * kKVH
-    # bytes from the start, and the extra unused bytes are harmless. attn_step_new
-    # is different -- its K/V args are the local kout / vout scratch buffers, which
-    # ARE sized to exactly one packed K or V row (brow), so it keeps that type.
-    f_step = ef("attn_step", ATTN / "attn_step.cc", [u8_a, u8_a, fq, foacc, fml, pb_ty] + h0_arg, ATTN_FLAGS)
+    # attn_step / attn_stepb read the CACHED KV rows through of_akv, whose element is
+    # `brow` -- one packed K (or V) row, 544 B under q8 / 1024 B under bf16. The C++
+    # signature is `kvout_t *`, which is exactly `brow` in each quant (uint8_t* for q8,
+    # bfloat16* for bf16); the reader reads kKVHeadBytes * kKVH bytes from offset 0,
+    # which is 544 under q8 and 512 * 2 = 1024 under bf16 -- full element in each case.
+    # (The pre-fix code declared [u8_a, u8_a], i.e. 1024-B elements, for these args --
+    # correct against the reader's 544-B/1024-B reads but wrong against the FIFO's
+    # actual element tiling under q8. Under bf16 the sizes coincided so the file
+    # compiled and ran; under q8 they did not, and the KV cache was corrupt. Same for
+    # attn_stepb's [brow] * (2 * RB) below.) attn_step_new's args were already `brow`
+    # because its K/V come from core-local kout/vout scratch, not the FIFO.
+    f_step = ef("attn_step", ATTN / "attn_step.cc", [brow, brow, fq, foacc, fml, pb_ty] + h0_arg, ATTN_FLAGS)
     f_stepn = ef("attn_step_new", ATTN / "attn_step_new.cc", [brow, brow, fq, foacc, fml] + h0_arg, ATTN_FLAGS)
-    f_stepb = (ef("attn_stepb", ATTN / "attn_stepb.cc", [u8_a] * (2 * RB) + [fq, foacc, fml, pb_ty] + h0_arg,
+    f_stepb = (ef("attn_stepb", ATTN / "attn_stepb.cc", [brow] * (2 * RB) + [fq, foacc, fml, pb_ty] + h0_arg,
                   ATTN_FLAGS) if RB > 1 else None)
     f_fin = ef("attn_fin_ng", ATTN / "attn_fin_ng.cc", [foacc, fml, og_ty, i32], ATTN_FLAGS)
 
     # ---- fifos, as dx.py: ain, the KV-row fifo (core 0's two cache rows ONLY), and one og
     # fifo per attention core
     of_ain = ObjectFifo(u8_a, name="ain", depth=max(4, 2 * RB + 2, 1 + NPTAB + 1))
+    # The cached-KV fifo, mirroring dx.py: element = one packed K (or V) row. Under q8
+    # the packed row is L.KV_ELEM_BYTES = 544 B (16 blocks of [bf16 scale + 32 int8]),
+    # under bf16 it is KVW bf16 = 1024 B. L.KV_ROW = 2 * L.KV_ELEM_BYTES at every quant
+    # (1088 under q8, 2048 under bf16), so every fill step must divide into 2 whole
+    # elements of this size -- exactly what this fifo provides.
+    #
+    # Why not `ain`: its element is u8_a = E_A = 1024 B (sized for the fp32 q/k/v
+    # projections it also carries). Under bf16, KV_ROW / u8_a = 2.0 -- fine, and that
+    # is why the original code worked at bf16. Under q8, KV_ROW / u8_a = 1088 / 1024 =
+    # 1.0625 -- NOT an integer. IRON delivers fifo fills in whole elements, so a 1088-B
+    # fill into a 1024-B fifo either truncates (V row's last 64 B per position never
+    # arrive, so the V cache the prefill writes and generation reads disagrees) or pads
+    # (V row's tail is stale). Either way the q8 KV cache is corrupt -- which is what
+    # we measured: coherent bf16, garbage q8. A dedicated fifo whose element size is
+    # L.KV_ELEM_BYTES makes KV_ROW / 544 = 2 exactly, matching dx.py's own of_akv.
+    of_akv = ObjectFifo(brow, name="akv", depth=max(4, 2 * RB + 2))
     of_aout = ObjectFifo(brow, name="aout", depth=2)
     of_og = [ObjectFifo(og_ty, name=f"og{c}", depth=2) for c in range(ACORES)]
     # The bias stream, from dx.py: its own fifo rather than more elements on
@@ -195,7 +214,7 @@ def dx_attn(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, 
     of_abias = ObjectFifo(u8_ab, name="abias", depth=4) if QKVB else None
 
     # ---- verbatim from dx.py: _attn / attn_body / make_attn_body
-    def _attn(ain, aout, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb,
+    def _attn(ain, akv, aout, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb,
               f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, f_stepb, h0, bias_in=None):
         e = ain.acquire(1 + NPTAB)                              # [qn | kn] then the position record, NPTAB elements wide
         if NPTAB > 1:
@@ -240,21 +259,25 @@ def dx_attn(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, 
                 o[j] = vout[j]
             aout.release(1)
         f_init(oacc, ml)
+        # The cached rows come from of_akv, not of_ain. The two fifos have different
+        # element sizes (ain = 1024-B u8_a for the q/k/v projections, akv = 544-B
+        # `brow` for one packed K or V row), so the acquire/release has to be on the
+        # matching fifo. dx.py's _attn does exactly this for exactly this reason.
         if RB > 1:
             for _ in range_(pb[4]):                             # whole blocks of RB rows
-                e = ain.acquire(2 * RB)
+                e = akv.acquire(2 * RB)
                 args = [e[i] for i in range(2 * RB)] + [qs, oacc, ml, pb] + ([h0] if ACORES > 1 else [])
                 f_stepb(*args)
-                ain.release(2 * RB)
+                akv.release(2 * RB)
             for _ in range_(pb[5]):                             # what did not fill a block
-                e = ain.acquire(2)
+                e = akv.acquire(2)
                 f_step(e[0], e[1], qs, oacc, ml, pb, h0) if ACORES > 1 else f_step(e[0], e[1], qs, oacc, ml, pb)
-                ain.release(2)
+                akv.release(2)
         else:
             for _ in range_(pb[1]):                             # nf cached rows (K_t, V_t)
-                e = ain.acquire(2)
+                e = akv.acquire(2)
                 f_step(e[0], e[1], qs, oacc, ml, pb, h0) if ACORES > 1 else f_step(e[0], e[1], qs, oacc, ml, pb)
-                ain.release(2)
+                akv.release(2)
         f_stepn(kout, vout, qs, oacc, ml, h0) if ACORES > 1 else f_stepn(kout, vout, qs, oacc, ml)
         for hp in range_(N_OG):
             o = ogout.acquire(1)
@@ -266,47 +289,47 @@ def dx_attn(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, 
     # the exact function it presented before. The bias fifo is the worker's SECOND
     # argument, before the drains.
     if QKVB and RB > 1:
-        def attn_body(ain, bias_in, aout, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb, f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, f_stepb):
-            _attn(ain, aout, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb,
+        def attn_body(ain, akv, bias_in, aout, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb, f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, f_stepb):
+            _attn(ain, akv, aout, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb,
                   f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, f_stepb, 0, bias_in)
 
         def make_attn_body(c):
             h0 = c * NHL
-            def body(ain, bias_in, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb, f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, f_stepb):
-                _attn(ain, None, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb,
+            def body(ain, akv, bias_in, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb, f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, f_stepb):
+                _attn(ain, akv, None, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb,
                       f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, f_stepb, h0, bias_in)
             return body
     elif QKVB:
-        def attn_body(ain, bias_in, aout, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb, f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin):
-            _attn(ain, aout, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb,
+        def attn_body(ain, akv, bias_in, aout, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb, f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin):
+            _attn(ain, akv, aout, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb,
                   f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, None, 0, bias_in)
 
         def make_attn_body(c):
             h0 = c * NHL
-            def body(ain, bias_in, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb, f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin):
-                _attn(ain, None, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb,
+            def body(ain, akv, bias_in, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb, f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin):
+                _attn(ain, akv, None, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb,
                       f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, None, h0, bias_in)
             return body
     elif RB > 1:
-        def attn_body(ain, aout, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb, f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, f_stepb):
-            _attn(ain, aout, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb,
+        def attn_body(ain, akv, aout, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb, f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, f_stepb):
+            _attn(ain, akv, aout, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb,
                   f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, f_stepb, 0)
 
         def make_attn_body(c):
             h0 = c * NHL
-            def body(ain, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb, f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, f_stepb):
-                _attn(ain, None, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb,
+            def body(ain, akv, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb, f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, f_stepb):
+                _attn(ain, akv, None, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb,
                       f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, f_stepb, h0)
             return body
     else:
-        def attn_body(ain, aout, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb, f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin):
-            _attn(ain, aout, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb,
+        def attn_body(ain, akv, aout, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb, f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin):
+            _attn(ain, akv, aout, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb,
                   f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, None, 0)
 
         def make_attn_body(c):
             h0 = c * NHL
-            def body(ain, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb, f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin):
-                _attn(ain, None, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb,
+            def body(ain, akv, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb, f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin):
+                _attn(ain, akv, None, ogout, qn, kn, cs, qs, tmp, kout, vout, oacc, ml, pb,
                       f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin, None, h0)
             return body
 
@@ -320,13 +343,13 @@ def dx_attn(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, 
     afns = [f_meta, f_q, f_k, f_v, f_init, f_step, f_stepn, f_fin] + ([f_stepb] if RB > 1 else [])
     bcons = (lambda: [of_abias.cons()]) if QKVB else (lambda: [])
 
-    workers = [Worker(attn_body, fn_args=[of_ain.cons()] + bcons() + [of_aout.prod(), of_og[0].prod()] + abufs(0) + afns,
+    workers = [Worker(attn_body, fn_args=[of_ain.cons(), of_akv.cons()] + bcons() + [of_aout.prod(), of_og[0].prod()] + abufs(0) + afns,
                       tile=Tile(2, 3), stack_size=0x1800)]
     for c in range(1, ACORES):
-        workers.append(Worker(make_attn_body(c), fn_args=[of_ain.cons()] + bcons() + [of_og[c].prod()] + abufs(c) + afns,
+        workers.append(Worker(make_attn_body(c), fn_args=[of_ain.cons(), of_akv.cons()] + bcons() + [of_og[c].prod()] + abufs(c) + afns,
                               tile=Tile(2 + c, 3), stack_size=0x1800))
 
-    def _sequence_attn(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, ain_p, aout_c, og_cs, abias_p):
+    def _sequence_attn(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, ain_p, akv_p, aout_c, og_cs, abias_p):
         # a_pool / c_xres: unused dummies, kept only for buffer-argument
         # position (see dx_attn()'s own comment).
         # 0167 stage 12 / #32: verbatim (minus the o-proj/GEMV lines, which
@@ -349,26 +372,38 @@ def dx_attn(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, 
             pa_in.fill(abias_p, a_consts, bt(L.CD_BYTES, L.CD_QB, QW * 2))
             pa_in.fill(abias_p, a_consts, bt(L.CD_BYTES, L.CD_KB, KVW * 2))
             pa_in.fill(abias_p, a_consts, bt(L.CD_BYTES, L.CD_VB, KVW * 2))
-        pa_in.fill(ain_p, a_kv, bt(L.KV_BYTES, 0, L.KV_ROW))                   # the window: rows [0, nf) (attnpos)
+        # The KV window fill goes into of_akv (544-B elements under q8, 1024-B under
+        # bf16), NOT of_ain (1024-B elements under every quant). bf16 works either way
+        # (same size), but q8 does not: 1088 / 1024 = 1.0625, i.e. the fill would not
+        # tile into whole `ain` elements. akv / KV_ROW = 1088 / 544 = 2 exactly, which
+        # is what attn_step's acquire(2) expects.
+        pa_in.fill(akv_p, a_kv, bt(L.KV_BYTES, 0, L.KV_ROW))                   # the window: rows [0, nf) (attnpos)
         pa_out.finish()                                           # og (and the new cache row) are in DDR
         pa_in.finish()
 
     # The bias fill lands between the q/k/v and the window on another fifo, so the
     # Runtime must hand an extra arg over ABI (same shape-selection dx.py uses).
     if QKVB:
-        def sequence_attn(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, ain_p, abias_p, aout_c, og_cs):
-            _sequence_attn(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, ain_p, aout_c, og_cs, abias_p)
+        def sequence_attn(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, ain_p, akv_p, abias_p, aout_c, og_cs):
+            _sequence_attn(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, ain_p, akv_p, aout_c, og_cs, abias_p)
     else:
-        def sequence_attn(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, ain_p, aout_c, og_cs):
-            _sequence_attn(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, ain_p, aout_c, og_cs, None)
+        def sequence_attn(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, ain_p, akv_p, aout_c, og_cs):
+            _sequence_attn(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, ain_p, akv_p, aout_c, og_cs, None)
 
     # Tile(0, 0) is free in this design's shim map (ain owns (2, 0), aout (1, 0),
     # og (3..acores, 0)) and carries exactly the MM2S channel the bias needs; dx.py
     # makes the same allocation on its own free column.
     bprod = [of_abias.prod(tile=Tile(0, 0))] if QKVB else []
+    # Tile(7, 0): the one MM2S shim column guaranteed free at every ACORES dx_attn.py
+    # can select for Nanbeige (ACORES is a divisor of NH=20 -> 1, 2, 4 or 5, so og
+    # consumers span Tile(2..6, 0); aout uses (1, 0) S2MM and ain uses (2, 0) MM2S;
+    # abias, when QKVB, uses (0, 0) MM2S). Putting the akv producer on 7 avoids any
+    # collision at the top of the range. dx.py makes the same allocation on its own
+    # free column (3); dx_attn.py's shim map is sparser, so 7 is safe here.
     rt = Runtime(sequence_attn,
                  [pool_ty, xres_ty, consts_ty, kv_ty, act_ty, ptab_ty,
-                  of_ain.prod(tile=Tile(2, 0))] + bprod + [of_aout.cons(tile=Tile(1, 0)),
+                  of_ain.prod(tile=Tile(2, 0)),
+                  of_akv.prod(tile=Tile(7, 0))] + bprod + [of_aout.cons(tile=Tile(1, 0)),
                   [of_og[c].cons(tile=Tile(2 + c, 0)) for c in range(ACORES)]])
     return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
 

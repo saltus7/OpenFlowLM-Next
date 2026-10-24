@@ -69,7 +69,7 @@ from .spec import DENSE, DENSE_LOCAL, ModelSpec
 # Only the ROW SIZE and the kernel flag change -- no runtime switch, no Python-to-kernel
 # plumbing, one export per quant choice. Block size is 32 throughout, matching the weight
 # quantizer so the inner dequant reuses the block law the pool packer already documents.
-KV_QUANT = "q8"  # "bf16" | "q8" | "q4_1"
+KV_QUANT = "bf16"  # "bf16" | "q8" | "q4_1"
 KV_BLOCK = 32
 # Cached rows per attention kernel call, lowered only when the cache is quantized.
 # bf16 keeps the family's own RB (attnknobs.py; 4 for llama3, 8 for others) so the
@@ -373,7 +373,7 @@ def layout(spec: ModelSpec, max_ctx: int = 4096) -> DenseLayout:
     # quantizer uses for weights, so the dequant inner loop in attn.h's `dequant_kv_block`
     # is a direct sibling of gemv_q4.h's block load.
     if KV_QUANT == "bf16":
-        kv_elem_bytes = 2 * e_a                          # e_a bytes of K, e_a bytes of V
+        kv_elem_bytes = e_a                              # one K row (e_a bytes); V is the other half of kv_row
     elif KV_QUANT == "q8":
         nblk = e_a // 2 // KV_BLOCK                      # values in one K row / 32
         kv_elem_bytes = nblk * (2 + KV_BLOCK)            # bf16 d + 32 int8 codes per block
@@ -382,11 +382,14 @@ def layout(spec: ModelSpec, max_ctx: int = 4096) -> DenseLayout:
         kv_elem_bytes = nblk * (2 + 2 + KV_BLOCK // 2)   # bf16 d + bf16 m + 16 packed codes
     else:
         raise OpRangeError(f"dense: unknown KV_QUANT {KV_QUANT!r}")
-    # Diagnostic: pad to E_A multiple. For q8, unpadded 1088 / 1024 = 1.0625 non-integer,
-    # which the attention fifo fill cannot represent as whole elements. Padding to 2048
-    # removes the ratio mismatch at the cost of the memory savings. If this fixes the
-    # dispatch timeout, the fill was the issue and the refactor below is the real fix.
-    kv_row = ((2 * kv_elem_bytes + e_a - 1) // e_a) * e_a
+    # One K+V pair per position, in the chosen KV format. The of_akv fifo in dx.py
+    # carries each K or V row as a 544-byte (q8) or KVW-bf16 (bf16) `brow` element,
+    # so a 2 * KV_ELEM_BYTES fill is exactly two fifo elements and the kernel's
+    # akv.acquire(2) matches it cleanly. No padding to e_a is needed, and the q8 RAM
+    # saving at 262144 context (9.1 GB, not 17.2 GB) survives. (The pad-to-e_a variant
+    # that used to sit here was a diagnostic for q8's 1088 / 1024 = 1.0625 fill ratio;
+    # the of_akv split into fifo-sized elements is the actual fix.)
+    kv_row = 2 * kv_elem_bytes
     ptab_row = _ptab_row(spec)
     band = band_bytes(hid, pool_quant(spec))
     bands = lm_rows(spec) // BAND_ROWS
