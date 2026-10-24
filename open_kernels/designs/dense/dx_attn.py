@@ -65,6 +65,14 @@ SPEC = current_spec()
 R = QR.recipe(SPEC)
 L, G = R.layout, R.geo
 E_A = L.E_A
+KVW = G.KVW
+# One K-row (or V-row) in the cache, in the layout dense.py's KV_QUANT chose. The name
+# `brow` is kept for the fifo element that carries a cache row; bf16 keeps the original
+# (KVW,) bfloat16 type so the pre-quant path compiles byte-identically.
+KV_ELEM_BYTES = L.KV_ELEM_BYTES
+KV_QUANT = QR.KV_QUANT
+KV_BROW_ELEMS = KVW if KV_QUANT == "bf16" else KV_ELEM_BYTES
+KV_BROW_DTYPE = np.dtype[bfloat16] if KV_QUANT == "bf16" else np.dtype[np.uint8]
 QW, KVW = G.QW, G.KVW
 HID = G.HID
 QKVB = G.QKVB
@@ -83,6 +91,12 @@ if QKVB:                                               # same as dx.py: only a f
     ATTN_FLAGS.append("-DATTN_QKV_BIAS=1")
 if NPTAB > 1:                                          # same as dx.py
     ATTN_FLAGS.append("-DATTN_PTAB_SPLIT=1")
+# The KV format is a compile-time flag on attn.h: bf16 leaves the code byte-identical,
+# q8/q4_1 route the K/V reads and writes through dequant_kv_block / quant_kv_row.
+if KV_QUANT == "q8":
+    ATTN_FLAGS.append("-DKV_QUANT_Q8=1")
+elif KV_QUANT == "q4_1":
+    ATTN_FLAGS.append("-DKV_QUANT_Q4_1=1")
 for _k, _v in QR.probe_env().items():               # ATTN_NULL / ATTN_ABL, same as dx.py
     if _k != "ATTN_RB":
         ATTN_FLAGS.append(f"-D{_k}={_v}")
@@ -125,7 +139,7 @@ def dx_attn(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, 
     u8_ab = np.ndarray[(E_A // 2,), np.dtype[np.uint8]]    # the same heads of a bf16 bias (dx.py)
     pb_ty = np.ndarray[(8 if RB > 1 else 4,), np.dtype[np.int32]]
     bhd = np.ndarray[(G.HD,), np.dtype[bfloat16]]
-    brow = np.ndarray[(KVW,), np.dtype[bfloat16]]
+    brow = np.ndarray[(KV_BROW_ELEMS,), KV_BROW_DTYPE]
     og_ty = np.ndarray[(OGH * G.HD,), np.dtype[bfloat16]]   # attn_fin writes kOGH heads at a time
     fcs = np.ndarray[(G.ROT,), np.dtype[np.float32]]
     fhd = np.ndarray[(G.HD,), np.dtype[np.float32]]
@@ -156,6 +170,14 @@ def dx_attn(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, 
     f_v = ef("attn_v", ATTN / "attn_v.cc", [u8_a] + bz + [brow, i32], ATTN_FLAGS)
     f_init = ef("attn_init", ATTN / "attn_init.cc", [foacc, fml], ATTN_FLAGS)
     h0_arg = [i32] if ACORES > 1 else []
+    # attn_step / attn_stepb read the CACHED KV rows through the `ain` fifo, whose
+    # elements are u8_a (uint8[E_A] = 1024 B for Nanbeige -- sized for the widest
+    # element the pipeline carries, the fp32 q/k/v projections). Even under q8/q4_1
+    # the packed KV row is only the first 544 B of that 1024-byte element, so the
+    # declared arg type stays u8_a: the C++ `kvout_t *` reads kKVHeadBytes * kKVH
+    # bytes from the start, and the extra unused bytes are harmless. attn_step_new
+    # is different -- its K/V args are the local kout / vout scratch buffers, which
+    # ARE sized to exactly one packed K or V row (brow), so it keeps that type.
     f_step = ef("attn_step", ATTN / "attn_step.cc", [u8_a, u8_a, fq, foacc, fml, pb_ty] + h0_arg, ATTN_FLAGS)
     f_stepn = ef("attn_step_new", ATTN / "attn_step_new.cc", [brow, brow, fq, foacc, fml] + h0_arg, ATTN_FLAGS)
     f_stepb = (ef("attn_stepb", ATTN / "attn_stepb.cc", [u8_a] * (2 * RB) + [fq, foacc, fml, pb_ty] + h0_arg,
@@ -210,11 +232,11 @@ def dx_attn(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, 
             ain.release(1)
         if aout is not None:                                    # core 0 owns the cache row
             o = aout.acquire(1)
-            for j in range_(KVW):
+            for j in range_(KV_BROW_ELEMS):
                 o[j] = kout[j]
             aout.release(1)
             o = aout.acquire(1)
-            for j in range_(KVW):
+            for j in range_(KV_BROW_ELEMS):
                 o[j] = vout[j]
             aout.release(1)
         f_init(oacc, ml)

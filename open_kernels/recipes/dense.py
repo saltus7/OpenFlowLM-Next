@@ -37,14 +37,50 @@ the 27B these rules give the sizes ax.py uses (4096 / 4096 / 1024).
 from __future__ import annotations
 
 import os
-
 from dataclasses import dataclass, replace
 
 from .catalogue import LIMITS, OpRangeError, check_buffer_args, require
-from .qwen36moe import ATTN_LMAX  # Path A: the widest attention GEMM stream (window chunk)
-from .qwen36moe import (BAND_ROWS, CHUNK, ELEM, GEMM_T, MB, _op_index, band_bytes, chunk_bytes, q4_bytes,
-                        proj_op, q4_chunks, mixed_check, quant_check, require_gemv, role_bytes, roundup, tab_bytes)
+from .qwen36moe import (
+    ATTN_LMAX,  # Path A: the widest attention GEMM stream (window chunk)
+    BAND_ROWS,
+    ELEM,
+    GEMM_T,
+    MB,
+    _op_index,
+    band_bytes,
+    chunk_bytes,
+    mixed_check,
+    proj_op,
+    q4_chunks,
+    quant_check,
+    require_gemv,
+    role_bytes,
+    roundup,
+    tab_bytes,
+)
 from .spec import DENSE, DENSE_LOCAL, ModelSpec
+
+# ---- KV cache quantization ------------------------------------------------------------
+# Runtime-switchable by editing this constant and re-running export_qwen36_kernels.py.
+#   "bf16"  -- the original, 1024 B per K or V row at KVW=512
+#   "q8"    -- 544 B per row: 32-value blocks, bf16 scale + int8 codes (matches gemv_q8)
+#   "q4_1"  -- 320 B per row: 32-value blocks, bf16 scale + bf16 min + 4-bit codes
+#                         (matches gemv_q4/pools.cpp's q4_1 layout)
+# Only the ROW SIZE and the kernel flag change -- no runtime switch, no Python-to-kernel
+# plumbing, one export per quant choice. Block size is 32 throughout, matching the weight
+# quantizer so the inner dequant reuses the block law the pool packer already documents.
+KV_QUANT = "q8"  # "bf16" | "q8" | "q4_1"
+KV_BLOCK = 32
+# Cached rows per attention kernel call, lowered only when the cache is quantized.
+# bf16 keeps the family's own RB (attnknobs.py; 4 for llama3, 8 for others) so the
+# block kernel's throughput is untouched. q8/q4_1 turns every cached-row read into
+# a dequant sequence, and the block path's RB unroll factor multiplies the growth:
+#   RB=4: 16x dequant sites  (attn_rowb_impl's for-head x for-row x for-block)
+#   RB=2:  8x dequant sites
+#   RB=1: attn_stepb is retired entirely; every row goes through attn_step
+# Any of the three fits 16 KB of program memory *if* the dequant is noinline; RB=4
+# still spills over the 14.5 KB the bf16 code already uses.
+KV_RB_QUANTIZED = 1
 
 
 @dataclass(frozen=True)
@@ -59,7 +95,7 @@ class DenseLayout:
     # pool
     POOL_Q: int; POOL_K: int; POOL_V: int; POOL_O: int; POOL_UP: int; POOL_GATE: int; POOL_DOWN: int; POOL_BYTES: int
     # KV / ptab / lm_head
-    KV_ROW: int; PTAB_ROW: int; MAX_CTX: int; KV_BYTES: int; PTAB_BYTES: int
+    KV_ROW: int; KV_ELEM_BYTES: int; PTAB_ROW: int; MAX_CTX: int; KV_BYTES: int; PTAB_BYTES: int
     LMHEAD_POOL_BYTES: int; LMHEAD_BANDS: int; LMHEAD_BAND_BYTES: int
     ELN: int; E_A: int
 
@@ -246,8 +282,8 @@ def per_call(spec: ModelSpec) -> int:
 # ---- the fast attention path's knobs live in recipes/attnknobs.py (shared with the
 # MoE / Qwen3.5 recipe, which compiles the same attn.h); re-exported here because the
 # dense recipe is where they were first exposed and where cache.py and the tests look.
-from .attnknobs import (PROBE_VARS, RB_SUPPORTED, FAST_ATTENTION, MAX_ATTN_CORES,  # noqa: E402,F401
-                        probe_env, fast_attention, attn_cores, knobs as attn_knobs)
+from .attnknobs import FAST_ATTENTION, MAX_ATTN_CORES, PROBE_VARS, RB_SUPPORTED, attn_cores, fast_attention, probe_env  # noqa: E402,F401
+from .attnknobs import knobs as attn_knobs
 
 
 def geometry(spec: ModelSpec) -> DenseGeometry:
@@ -265,6 +301,13 @@ def geometry(spec: ModelSpec) -> DenseGeometry:
     # it; every other family's artifacts stay byte-identical until it has been.
     A = attn_knobs(spec, nh, hpo)
     vexp, acores, nhl, mls, rb = A.VEXP, A.ACORES, A.NHL, A.MLS, A.RB
+    # A quantized cache turns every cached-row read into a dequant sequence, and
+    # attn_rowb_impl unrolls that sequence RB times across (head, row, block). The
+    # bf16 code sits at 14480/16384 B on the attention core, so there is room for the
+    # dequant machinery at RB=2 (or RB=1, which retires attn_stepb entirely) but not
+    # at RB=4. Edit KV_RB_QUANTIZED to try 1, 2, or 4.
+    if KV_QUANT != "bf16":
+        rb = KV_RB_QUANTIZED
     return DenseGeometry(
         N_CORES=n, HID=hid, FF=ff, NH=nh, KVH=kvh, HD=hd, ROT=spec.rotary_dim, GATE=spec.attn_gate,
         QKNORM=spec.qk_norm, QKNORM_POST=spec.qk_norm and spec.family in QKNORM_POST_ROPE,
@@ -326,7 +369,24 @@ def layout(spec: ModelSpec, max_ctx: int = 4096) -> DenseLayout:
         p[name] = off
         off += role_bytes(spec, role, rows, cols)
     pool_bytes = roundup(off, MB)
-    kv_row = 2 * e_a
+    # One K-row (or V-row) in the chosen KV format. This is the same block-of-32 the pool
+    # quantizer uses for weights, so the dequant inner loop in attn.h's `dequant_kv_block`
+    # is a direct sibling of gemv_q4.h's block load.
+    if KV_QUANT == "bf16":
+        kv_elem_bytes = 2 * e_a                          # e_a bytes of K, e_a bytes of V
+    elif KV_QUANT == "q8":
+        nblk = e_a // 2 // KV_BLOCK                      # values in one K row / 32
+        kv_elem_bytes = nblk * (2 + KV_BLOCK)            # bf16 d + 32 int8 codes per block
+    elif KV_QUANT == "q4_1":
+        nblk = e_a // 2 // KV_BLOCK
+        kv_elem_bytes = nblk * (2 + 2 + KV_BLOCK // 2)   # bf16 d + bf16 m + 16 packed codes
+    else:
+        raise OpRangeError(f"dense: unknown KV_QUANT {KV_QUANT!r}")
+    # Diagnostic: pad to E_A multiple. For q8, unpadded 1088 / 1024 = 1.0625 non-integer,
+    # which the attention fifo fill cannot represent as whole elements. Padding to 2048
+    # removes the ratio mismatch at the cost of the memory savings. If this fixes the
+    # dispatch timeout, the fill was the issue and the refactor below is the real fix.
+    kv_row = ((2 * kv_elem_bytes + e_a - 1) // e_a) * e_a
     ptab_row = _ptab_row(spec)
     band = band_bytes(hid, pool_quant(spec))
     bands = lm_rows(spec) // BAND_ROWS
@@ -337,7 +397,7 @@ def layout(spec: ModelSpec, max_ctx: int = 4096) -> DenseLayout:
         AD_H=a["h"], AD_OUT2=a["out2"], AD_JUNK=a["junk"], AD_T=a["t"], AD_T2=a["t2"], AD_BYTES=ad_bytes,
         POOL_Q=p["q"], POOL_K=p["k"], POOL_V=p["v"], POOL_O=p["o"], POOL_UP=p["up"], POOL_GATE=p["gate"],
         POOL_DOWN=p["down"], POOL_BYTES=pool_bytes,
-        KV_ROW=kv_row, PTAB_ROW=ptab_row, MAX_CTX=max_ctx, KV_BYTES=max_ctx * kv_row, PTAB_BYTES=max_ctx * ptab_row,
+        KV_ROW=kv_row, KV_ELEM_BYTES=kv_elem_bytes, PTAB_ROW=ptab_row, MAX_CTX=max_ctx, KV_BYTES=max_ctx * kv_row, PTAB_BYTES=max_ctx * ptab_row,
         LMHEAD_POOL_BYTES=roundup(roundup(bands, n) * band, MB), LMHEAD_BANDS=bands, LMHEAD_BAND_BYTES=band,
         ELN=eln, E_A=e_a,
     )
@@ -680,7 +740,8 @@ def rows_route(spec: ModelSpec) -> dict | None:
     """The L-row pass's kernels (dxl, lmhl) and the manifest's `rows` section for a ROWS_FAMILIES spec, else None."""
     if spec.family not in ROWS_FAMILIES:
         return None
-    from .dxl import head_act_bytes, layout as dxl_layout, lora_pack_plan
+    from .dxl import head_act_bytes, lora_pack_plan
+    from .dxl import layout as dxl_layout
     try:
         X = dxl_layout(spec, ROWS_L)
     except OpRangeError:
@@ -748,7 +809,8 @@ def manifest_layout(spec: ModelSpec, max_ctx: int) -> dict:
     return {"hidden": spec.hidden, "vocab": lm_rows(spec), "real_vocab": spec.real_vocab,
             "chunk_bytes": chunk_bytes(pool_quant(spec)), "pool_bytes": L.POOL_BYTES,
             "lmhead_pool_bytes": L.LMHEAD_POOL_BYTES,
-            "kv_row": L.KV_ROW, "ptab_row": L.PTAB_ROW, "rotary_dim": spec.rotary_dim, "rope_theta": spec.rope_theta,
+            "kv_row": L.KV_ROW, "kv_quant": KV_QUANT, "kv_block": KV_BLOCK,
+            "ptab_row": L.PTAB_ROW, "rotary_dim": spec.rotary_dim, "rope_theta": spec.rope_theta,
             "rope_inv_freq": spec.rope_inv_freq()}     # the global table's short/base table; each ptab
             # global carries its own (both tables, for a longrope family -- see programs())
 
