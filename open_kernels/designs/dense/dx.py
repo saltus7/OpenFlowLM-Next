@@ -173,6 +173,8 @@ if KV_QUANT == "q8":
     ATTN_FLAGS.append("-DKV_QUANT_Q8=1")
 elif KV_QUANT == "q4_1":
     ATTN_FLAGS.append("-DKV_QUANT_Q4_1=1")
+elif KV_QUANT == "q4_0":
+    ATTN_FLAGS.append("-DKV_QUANT_Q4_0=1")
 OGH = min(NHL, G.HPO)                                  # heads in one og element (attn.h's kOGH)
 N_OG = NHL // OGH                                      # og elements a core emits
 LN_FLAGS = [f"-DLN_N={HID}", f"-DLN_EPS={G.EPS:g}f"]

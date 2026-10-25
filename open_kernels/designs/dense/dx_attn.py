@@ -97,6 +97,8 @@ if KV_QUANT == "q8":
     ATTN_FLAGS.append("-DKV_QUANT_Q8=1")
 elif KV_QUANT == "q4_1":
     ATTN_FLAGS.append("-DKV_QUANT_Q4_1=1")
+elif KV_QUANT == "q4_0":
+    ATTN_FLAGS.append("-DKV_QUANT_Q4_0=1")
 for _k, _v in QR.probe_env().items():               # ATTN_NULL / ATTN_ABL, same as dx.py
     if _k != "ATTN_RB":
         ATTN_FLAGS.append(f"-D{_k}={_v}")

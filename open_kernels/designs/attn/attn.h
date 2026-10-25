@@ -49,7 +49,7 @@
 //   q4_1  -- [d bf16[NB]][m bf16[NB]][codes uint8[NB*16]] per head
 // A kvout_t is the byte type of the KV row `kout` / `vout` write to and Kt / Vt read
 // from. bf16 keeps it as bfloat16 so nothing below KV_QUANT_Q8/Q4_1 changes.
-#if defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1)
+#if defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1) || defined(KV_QUANT_Q4_0)
 typedef uint8_t kvout_t;
 #else
 typedef bfloat16 kvout_t;
@@ -143,7 +143,7 @@ typedef bfloat16 kvout_t;
 #if ATTN_BLOCK_ONLY && (ATTN_RB < 2 || !ATTN_VEXP)
 #error "attn.h: ATTN_BLOCK_ONLY needs the block kernel (ATTN_RB > 1) on the vector-softmax path (ATTN_VEXP)"
 #endif
-#if ATTN_TREE && (defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1))
+#if ATTN_TREE && (defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1) || defined(KV_QUANT_Q4_0))
 #error "attn.h: KV_QUANT_Q8/Q4_1 requires ATTN_TREE=0 (attn_score2 / attn_pv not yet patched)"
 #endif
 #ifndef ATTN_NHL
@@ -487,7 +487,7 @@ static inline void attn_q_impl(const float *__restrict qe ATTN_BIAS_PARM, const 
 // Match pools.cpp's bf16_floor / bf16_ceil / bf16_rne bits-for-bits, so a q4_1 KV
 // block and a q4_1 weight block use the same rounding. __builtin_memcpy avoids
 // <cstring> on the AIE toolchain.
-#if defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1)
+#if defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1) || defined(KV_QUANT_Q4_0)
 static inline uint16_t read_u16(const uint8_t *p) { uint16_t v; __builtin_memcpy(&v, p, 2); return v; }
 static inline void write_u16(uint8_t *p, uint16_t v) { __builtin_memcpy(p, &v, 2); }
 static inline float bf16_bits_to_f32(uint16_t bits) {
@@ -512,8 +512,10 @@ static inline uint16_t f32_to_bf16_ceil_bits(float f) {
 static constexpr unsigned kKVNBlk = kHD / 32;                 // 32-value blocks per head
 #if defined(KV_QUANT_Q8)
 static constexpr unsigned kKVBlockBytes = 2 + 32;             // bf16 d + int8 codes
-#else
+#elif defined(KV_QUANT_Q4_1)
 static constexpr unsigned kKVBlockBytes = 2 + 2 + 16;         // bf16 d + bf16 m + 4-bit codes
+#elif defined(KV_QUANT_Q4_0)
+static constexpr unsigned kKVBlockBytes = 2 + 16;             // bf16 d + signed 4-bit codes
 #endif
 static constexpr unsigned kKVHeadBytes = kKVNBlk * kKVBlockBytes;
 
@@ -545,7 +547,7 @@ static void quant_kv_row(const float *__restrict src, kvout_t *__restrict dst) {
             if (q < -127) q = -127; if (q > 127) q = 127;
             codes[i] = (int8_t)q;
         }
-    #else
+    #elif defined(KV_QUANT_Q4_1)
         float lo = b[0], hi = b[0];
         #pragma clang loop unroll(disable)
         for (unsigned i = 1; i < 32; ++i) { if (b[i] < lo) lo = b[i]; if (b[i] > hi) hi = b[i]; }
@@ -564,6 +566,25 @@ static void quant_kv_row(const float *__restrict src, kvout_t *__restrict dst) {
             if (q0 < 0) q0 = 0; if (q0 > 15) q0 = 15;
             if (q1 < 0) q1 = 0; if (q1 > 15) q1 = 15;
             codes[i] = (uint8_t)(q0 | (q1 << 4));
+        }
+    #elif defined(KV_QUANT_Q4_0)
+        // Symmetric q4_0: d = amax / 7, signed codes [-7, 7] stored as (code + 8) in [1, 15].
+        // Both extremes reproduce exactly; code 0 (would be -8) is unused (6% precision waste).
+        float amax = 0.0f;
+        #pragma clang loop unroll(disable)
+        for (unsigned i = 0; i < 32; ++i) { const float a = b[i] < 0.0f ? -b[i] : b[i]; if (a > amax) amax = a; }
+        const uint16_t d_bits = f32_to_bf16_rne_bits(amax / 7.0f);
+        write_u16(dst + 2 * bi, d_bits);
+        const float d_r = bf16_bits_to_f32(d_bits);
+        const float inv = d_r > 0.0f ? 1.0f / d_r : 0.0f;
+        uint8_t *codes = dst + 2 * kKVNBlk + bi * 16;
+        #pragma clang loop unroll(disable)
+        for (unsigned i = 0; i < 16; ++i) {
+            int q0 = (int)(b[2 * i]     * inv + (b[2 * i]     >= 0.0f ? 0.5f : -0.5f));
+            int q1 = (int)(b[2 * i + 1] * inv + (b[2 * i + 1] >= 0.0f ? 0.5f : -0.5f));
+            if (q0 < -7) q0 = -7; if (q0 > 7) q0 = 7;
+            if (q1 < -7) q1 = -7; if (q1 > 7) q1 = 7;
+            codes[i] = (uint8_t)((q0 + 8) | ((q1 + 8) << 4));
         }
     #endif
     }
@@ -589,7 +610,7 @@ static inline void dequant_kv_block(const kvout_t *__restrict row, unsigned bi,
     accf32 a;
     a.from_vector(v);
     aie::store_v(dst, a.template to_vector<bfloat16>());
-#else
+#elif defined(KV_QUANT_Q4_1)
     const float d = bf16_bits_to_f32(read_u16(row + 2 * bi));
     const float m = bf16_bits_to_f32(read_u16(row + 2 * kKVNBlk + 2 * bi));
     const uint8_t *codes = row + 4 * kKVNBlk + bi * 16;
@@ -603,6 +624,23 @@ static inline void dequant_kv_block(const kvout_t *__restrict row, unsigned bi,
     aie::vector<int32_t, 32> ci = aie::load_v<32>(ci_buf);
     v32f v = fscaleN<32>(aie::to_float<float>(ci, 0), d);
     v = faddN<32>(v, aie::broadcast<float, 32>(m));
+    accf32 a;
+    a.from_vector(v);
+    aie::store_v(dst, a.template to_vector<bfloat16>());
+#elif defined(KV_QUANT_Q4_0)
+    // Symmetric q4_0 dequant: (stored - 8) * d. Vector path matches the q8 pattern
+    // that is proven working — alignas(128), load_v<32>, to_float, fscaleN.
+    const float d = bf16_bits_to_f32(read_u16(row + 2 * bi));
+    const uint8_t *codes = row + 2 * kKVNBlk + bi * 16;
+    alignas(128) int32_t ci_buf[32];
+    #pragma clang loop unroll(disable)
+    for (unsigned i = 0; i < 16; ++i) {
+        const uint8_t byte = codes[i];
+        ci_buf[2 * i]     = static_cast<int32_t>(byte & 0xF) - 8;
+        ci_buf[2 * i + 1] = static_cast<int32_t>(byte >> 4)  - 8;
+    }
+    aie::vector<int32_t, 32> ci = aie::load_v<32>(ci_buf);
+    const v32f v = fscaleN<32>(aie::to_float<float>(ci, 0), d);
     accf32 a;
     a.from_vector(v);
     aie::store_v(dst, a.template to_vector<bfloat16>());
@@ -630,7 +668,7 @@ static inline void attn_k_impl(const float *__restrict ke ATTN_BIAS_PARM, const 
 #else
   const float *__restrict ksrc = ke;
 #endif
-#if defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1)
+#if defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1) || defined(KV_QUANT_Q4_0)
   for (unsigned i = 0; i < kHPE; ++i) {
     norm_rope(ksrc + i * kHD, kn, cs, tmp);
     quant_kv_row(tmp, kout + (e * kHPE + i) * kKVHeadBytes);
@@ -651,7 +689,7 @@ static inline void attn_v_impl(const float *__restrict ve ATTN_BIAS_PARM, kvout_
 #else
   const float *__restrict vsrc = ve;
 #endif
-#if defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1)
+#if defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1) || defined(KV_QUANT_Q4_0)
   for (unsigned i = 0; i < kHPE; ++i) quant_kv_row(vsrc + i * kHD, vout + (e * kHPE + i) * kKVHeadBytes);
 #else
   for (unsigned i = 0; i < kHPE; ++i) to_bf16_hd(vsrc + i * kHD, vout + (e * kHPE + i) * kHD);
@@ -707,7 +745,7 @@ __attribute__((noinline)) inline void attn_row_impl(const kvout_t *__restrict Kt
   alignas(128) float sv[kMLS];
   // One head's KV row, dequantized. Only when the cache is packed; bf16 reads
   // straight through and the compiler drops this.
-#if defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1)
+#if defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1) || defined(KV_QUANT_Q4_0)
   alignas(128) bfloat16 dq_row[kHD];
 #endif
   // The rescale factors leave phase 2 already split into the bf16 (hi, lo) pairs the
@@ -733,7 +771,7 @@ __attribute__((noinline)) inline void attn_row_impl(const kvout_t *__restrict Kt
     // arithmetic and measured 116.6 -> 141.2 ms: holding four heads' vectors live
     // to feed it spills, and the spill costs more than the reduction saves.)
     accf32 d0 = aie::zeros<accfloat, kV>(), d1 = aie::zeros<accfloat, kV>();
-#if defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1)
+#if defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1) || defined(KV_QUANT_Q4_0)
     dequant_kv_row(Kt + kvh * kKVHeadBytes, dq_row);
     ATTN_UNROLL_HD
     for (unsigned j = 0; j < kHD; j += kV) {
@@ -803,7 +841,7 @@ __attribute__((noinline)) inline void attn_row_impl(const kvout_t *__restrict Kt
     const unsigned kvh = (kSplit ? ((unsigned)h0 + hl) : hl) / (kNH / kKVH);
     const bfloat16 bhh = bh[hl], bll = bl[hl];
     float *o = oacc + hl * kHD;
-#if defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1)
+#if defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1) || defined(KV_QUANT_Q4_0)
     dequant_kv_row(Vt + kvh * kKVHeadBytes, dq_row);
     const bfloat16 *v = dq_row;
 #else
@@ -982,7 +1020,7 @@ __attribute__((noinline)) inline void attn_rowb_impl(const kvout_t *const *__res
   alignas(128) bfloat16 ph[kPV], pl[kPV];
   alignas(128) bfloat16 ah[kMLS], al[kMLS];
   alignas(128) int32_t grew_i[kMLS];
-#if defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1)
+#if defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1) || defined(KV_QUANT_Q4_0)
   // K phase: one full row dequantized at a time (kv_row_scratch[0], reused for every
   // (head, row)). V phase: all kRB rows dequantized at once (kv_row_scratch[0..kRB-1]),
   // so the j-block inner loop can read whole blocks without a per-block dequant call.
@@ -1039,7 +1077,7 @@ __attribute__((noinline)) inline void attn_rowb_impl(const kvout_t *const *__res
     const bfloat16 *q = qs + h * kHD;
     AIE_LOOP_UNROLL_FULL
     for (unsigned r = 0; r < kRB; ++r) {
-#if defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1)
+#if defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1) || defined(KV_QUANT_Q4_0)
       dequant_kv_row(Kb[r] + kvh * kKVHeadBytes, kv_row_scratch[0]);
       const bfloat16 *k = kv_row_scratch[0];
 #else
@@ -1143,7 +1181,7 @@ __attribute__((noinline)) inline void attn_rowb_impl(const kvout_t *const *__res
     attn_pv(o, Vb[0] + kvh * kHD, Vb[1] + kvh * kHD, Vb[kRB > 2 ? 2 : 0] + kvh * kHD,
             Vb[kRB > 2 ? 3 : 0] + kvh * kHD, ph + hl, pl + hl);
 #else
-#if defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1)
+#if defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1) || defined(KV_QUANT_Q4_0)
     // Dequantize all kRB V rows once, before the j loop, so the dequant code
     // runs a single call per row rather than a per-(j, r) inline copy.
     for (unsigned r = 0; r < kRB; ++r) dequant_kv_row(Vb[r] + kvh * kKVHeadBytes, kv_row_scratch[r]);
@@ -1154,7 +1192,7 @@ __attribute__((noinline)) inline void attn_rowb_impl(const kvout_t *const *__res
       acc.from_vector(aie::load_v<kV>(o + j));
       AIE_LOOP_UNROLL_FULL
       for (unsigned r = 0; r < kRB; ++r) {
-#if defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1)
+#if defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1) || defined(KV_QUANT_Q4_0)
         const vbN<kV> vj = aie::load_v<kV>(kv_row_scratch[r] + j);
 #else
         const vbN<kV> vj = aie::load_v<kV>(Vb[r] + kvh * kHD + j);

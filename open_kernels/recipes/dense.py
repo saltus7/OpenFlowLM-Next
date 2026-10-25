@@ -69,7 +69,7 @@ from .spec import DENSE, DENSE_LOCAL, ModelSpec
 # Only the ROW SIZE and the kernel flag change -- no runtime switch, no Python-to-kernel
 # plumbing, one export per quant choice. Block size is 32 throughout, matching the weight
 # quantizer so the inner dequant reuses the block law the pool packer already documents.
-KV_QUANT = "q8"  # "bf16" | "q8" | "q4_1"
+KV_QUANT = "q4_0"  # "bf16" | "q8" | "q4_1" | "q4_0"
 KV_BLOCK = 32
 # Cached rows per attention kernel call, lowered only when the cache is quantized.
 # bf16 keeps the family's own RB (attnknobs.py; 4 for llama3, 8 for others) so the
@@ -380,6 +380,9 @@ def layout(spec: ModelSpec, max_ctx: int = 4096) -> DenseLayout:
     elif KV_QUANT == "q4_1":
         nblk = e_a // 2 // KV_BLOCK
         kv_elem_bytes = nblk * (2 + 2 + KV_BLOCK // 2)   # bf16 d + bf16 m + 16 packed codes
+    elif KV_QUANT == "q4_0":
+        nblk = e_a // 2 // KV_BLOCK
+        kv_elem_bytes = nblk * (2 + KV_BLOCK // 2)       # bf16 d + 16 packed signed codes = 18 B/block
     else:
         raise OpRangeError(f"dense: unknown KV_QUANT {KV_QUANT!r}")
     # One K+V pair per position, in the chosen KV format. The of_akv fifo in dx.py

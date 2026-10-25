@@ -37,10 +37,15 @@ void Nanbeige::load_model(std::string model_path, json model_info, int default_c
     this->sampler.reset();
 
     sampler_config config;
-    config.top_k = 20;
+    // Original sampling
+    // config.top_k = 20;
+    // config.top_p = 0.95;
+    // config.min_p = 0.0;
+    // config.temperature = 0.6;
+    config.top_k = 32;
     config.top_p = 0.95;
-    config.min_p = 0.0;
-    config.temperature = 0.6;
+    config.min_p = 0.01;
+    config.temperature = 0.8;
 
     this->set_sampler(config);
     for (size_t i = 0; i < PROFILER_TYPE_NUM; i++) {
