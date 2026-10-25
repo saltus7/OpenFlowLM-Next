@@ -335,7 +335,12 @@ static inline void attn_meta_impl(const uint8_t *__restrict m0, const uint8_t *_
 __attribute__((noinline)) inline void norm_rope(const float *__restrict x, const bfloat16 *__restrict w,
                              const float *__restrict cs, float *__restrict dst) {
 #if !ATTN_QKNORM
-  for (unsigned j = 0; j < kHD; j += kV) aie::store_v(dst + j, aie::load_v<kV>(x + j));
+  // q8 build was producing dst[0..7] = x[8..15] from this exact loop (verified
+  // via dbg dump: input = raw K[0..31], output = raw K[8..39]). bf16 build with
+  // identical source is correct. Use __builtin_memcpy — the compiler's own
+  // built-in, what read_u16/write_u16 already rely on — to sidestep whatever
+  // codegen path the q8 TU is triggering.
+  __builtin_memcpy(dst, x, kHD * sizeof(float));
 #else
   accf32 ss = aie::zeros<accfloat, kV>();
   for (unsigned j = 0; j < kHD; j += kV) {
@@ -372,25 +377,36 @@ __attribute__((noinline)) inline void norm_rope(const float *__restrict x, const
   // rope on dims [0, ROT): pairs (a = dst[j], b = dst[j + ROT/2]); cs = [cos ROT/2 | sin ROT/2].
   // 32 pairs a step, then a 16-lane tail when ROT/2 is not a multiple of 32 (Phi-3 rotates
   // 96 of 128 dims: 48 pairs).
+  //
+  // q8 diagnosis: identical vector ops in the copy path above were miscompiled under
+  // -DKV_QUANT_Q8 (8-dim write shift), and the same miscompile appears to affect the
+  // rotation math here (K at pos>0 is 2.5x too large in magnitude, while pos 0 — where
+  // cos=1,sin=0 makes RoPE identity — is correct). Force the rotation through a local
+  // buffer + memcpy boundary, matching the copy fix above.
   constexpr unsigned kHalf = kRot / 2, kHalfV = kHalf - kHalf % kV;
-  for (unsigned j = 0; j < kHalfV; j += kV) {
-    const v32f c = aie::load_v<kV>(cs + j);
-    const v32f s = aie::load_v<kV>(cs + kHalf + j);
-    const v32f a = aie::load_v<kV>(dst + j);
-    const v32f b = aie::load_v<kV>(dst + kHalf + j);
-    aie::store_v(dst + j, fsub32(fmul32(a, c), fmul32(b, s)));
-    aie::store_v(dst + kHalf + j, fadd32(fmul32(b, c), fmul32(a, s)));
-  }
-#if (ATTN_ROT / 2) % 32
   {
-    const v16f c = aie::load_v<16>(cs + kHalfV);
-    const v16f s = aie::load_v<16>(cs + kHalf + kHalfV);
-    const v16f a = aie::load_v<16>(dst + kHalfV);
-    const v16f b = aie::load_v<16>(dst + kHalf + kHalfV);
-    aie::store_v(dst + kHalfV, fsubN<16>(fmulN<16>(a, c), fmulN<16>(b, s)));
-    aie::store_v(dst + kHalf + kHalfV, faddN<16>(fmulN<16>(b, c), fmulN<16>(a, s)));
-  }
+    alignas(128) float rope_tmp[kHD];
+    __builtin_memcpy(rope_tmp, dst, kHD * sizeof(float));
+    for (unsigned j = 0; j < kHalfV; j += kV) {
+      const v32f c = aie::load_v<kV>(cs + j);
+      const v32f s = aie::load_v<kV>(cs + kHalf + j);
+      const v32f a = aie::load_v<kV>(rope_tmp + j);
+      const v32f b = aie::load_v<kV>(rope_tmp + kHalf + j);
+      aie::store_v(rope_tmp + j, fsub32(fmul32(a, c), fmul32(b, s)));
+      aie::store_v(rope_tmp + kHalf + j, fadd32(fmul32(b, c), fmul32(a, s)));
+    }
+#if (ATTN_ROT / 2) % 32
+    {
+      const v16f c = aie::load_v<16>(cs + kHalfV);
+      const v16f s = aie::load_v<16>(cs + kHalf + kHalfV);
+      const v16f a = aie::load_v<16>(rope_tmp + kHalfV);
+      const v16f b = aie::load_v<16>(rope_tmp + kHalf + kHalfV);
+      aie::store_v(rope_tmp + kHalfV, fsubN<16>(fmulN<16>(a, c), fmulN<16>(b, s)));
+      aie::store_v(rope_tmp + kHalf + kHalfV, faddN<16>(fmulN<16>(b, c), fmulN<16>(a, s)));
+    }
 #endif
+    __builtin_memcpy(dst, rope_tmp, kHD * sizeof(float));
+  }
 #if ATTN_QKNORM_POST
   // the whole head, not just [0, ROT): the unrotated tail is scaled too
   for (unsigned j = 0; j < kHD; j += kV) {
@@ -508,7 +524,9 @@ __attribute__((noinline))
 static void quant_kv_row(const float *__restrict src, kvout_t *__restrict dst) {
     #pragma unroll 1
     for (unsigned bi = 0; bi < kKVNBlk; ++bi) {
-        const float *b = src + bi * 32;
+        // Force a hard address computation the compiler cannot fold
+        const int off = static_cast<int>(bi) * 32;
+        const float *b = src + off;
     // Same reason dequant_kv_block carries these: an auto-unrolled 32-iteration inner
     // loop here is 100+ instructions of machine code, and this body is compiled once
     // per (row, block) site. Left un-pragma'd it tips the attention core over 16 KB.
@@ -561,19 +579,33 @@ static inline void dequant_kv_block(const kvout_t *__restrict row, unsigned bi,
 #if defined(KV_QUANT_Q8)
     const float d = bf16_bits_to_f32(read_u16(row + 2 * bi));
     const int8_t *codes = reinterpret_cast<const int8_t *>(row + 2 * kKVNBlk + bi * 32);
+    alignas(128) int32_t ci_buf[32];
     #pragma clang loop unroll(disable)
-    for (unsigned i = 0; i < 32; ++i) dst[i] = (bfloat16)(codes[i] * d);
+    for (unsigned i = 0; i < 32; ++i) {
+        ci_buf[i] = static_cast<int32_t>(codes[i]);
+    }
+    aie::vector<int32_t, 32> ci = aie::load_v<32>(ci_buf);
+    const v32f v = fscaleN<32>(aie::to_float<float>(ci, 0), d);
+    accf32 a;
+    a.from_vector(v);
+    aie::store_v(dst, a.template to_vector<bfloat16>());
 #else
     const float d = bf16_bits_to_f32(read_u16(row + 2 * bi));
     const float m = bf16_bits_to_f32(read_u16(row + 2 * kKVNBlk + 2 * bi));
     const uint8_t *codes = row + 4 * kKVNBlk + bi * 16;
+    alignas(128) int32_t ci_buf[32];
     #pragma clang loop unroll(disable)
     for (unsigned i = 0; i < 16; ++i) {
         const uint8_t byte = codes[i];
-        const uint8_t lo = byte & 0xF, hi = byte >> 4;
-        dst[2 * i]     = (bfloat16)(lo * d + m);
-        dst[2 * i + 1] = (bfloat16)(hi * d + m);
+        ci_buf[2 * i]     = static_cast<int32_t>(byte & 0xF);
+        ci_buf[2 * i + 1] = static_cast<int32_t>(byte >> 4);
     }
+    aie::vector<int32_t, 32> ci = aie::load_v<32>(ci_buf);
+    v32f v = fscaleN<32>(aie::to_float<float>(ci, 0), d);
+    v = faddN<32>(v, aie::broadcast<float, 32>(m));
+    accf32 a;
+    a.from_vector(v);
+    aie::store_v(dst, a.template to_vector<bfloat16>());
 #endif
 }
 // Non-inline so this appears once in the ELF rather than once per (head, row)

@@ -2030,6 +2030,79 @@ void Core::step_impl(int token, const float* x, bool want_logits, const int64_t*
         timing_.part1_ms += blocked;
         timing_.dispatch_ms += elapsed;
     }
+    // Debug KV dump, gated by env var. Fires once: layer 0, pos 0.
+    // At this point, all layer dispatches for this token have completed and synced.
+    if ((pos_ == 0 || pos_ == 26) && std::getenv("OFLM_DUMP_KV")) {
+        uint16_t k_buf[2048 / 2]; 
+        kv_row(0, static_cast<int>(pos_), false, k_buf); // layer 0, row pos_, K (false = not V)
+        
+        const uint8_t* raw = reinterpret_cast<const uint8_t*>(k_buf);
+        fprintf(stderr, "\n=== OFLM_DUMP_KV: layer 0, pos %d ===\n", static_cast<int>(pos_));
+        fprintf(stderr, "man_.kv_row=%zu\n", man_.kv_row);
+
+        if (man_.kv_row == 1088) { // Q8 path
+            fprintf(stderr, "q8 scales (first 4 bf16 values): ");
+            for (int i = 0; i < 4; ++i) {
+                uint16_t bits = raw[2*i] | (raw[2*i+1] << 8);
+                uint32_t f32bits = (uint32_t)bits << 16;
+                float f; 
+                std::memcpy(&f, &f32bits, 4);
+                fprintf(stderr, "%.6f ", f);
+            }
+            fprintf(stderr, "\nq8 codes (block 0, 32 int8): ");
+            for (int i = 8; i < 40; ++i) fprintf(stderr, "%d ", (int8_t)raw[i]);
+            fprintf(stderr, "\n");
+            // DEBUG: raw bytes 0..127 as 32 floats — the dbg_save payload from
+            // attn_k_impl, which holds the first head's post-norm_rope tmp[0..31].
+            // Compare against bf16's K dump: if this matches bf16[0..31], then
+            // norm_rope wrote correctly and quant_kv_row's read is the bug. If it
+            // matches bf16[8..39], norm_rope is writing shifted.
+            fprintf(stderr, "dbg_in  as 32 floats (ksrc, pre-norm): ");
+            for (int i = 0; i < 32; ++i) {
+                float f; std::memcpy(&f, &raw[i * 4], 4);
+                fprintf(stderr, "%.5f ", f);
+            }
+            fprintf(stderr, "\n");
+            fprintf(stderr, "dbg_save as 32 floats (norm_rope output, head 0): ");
+            for (int i = 0; i < 32; ++i) {
+                float f; std::memcpy(&f, &raw[128 + i * 4], 4);
+                fprintf(stderr, "%.5f ", f);
+            }
+            fprintf(stderr, "\n");
+        } else {
+            fprintf(stderr, "bf16 K[0..15]: ");
+            for (int i = 0; i < 16; ++i) {
+                uint16_t bits = raw[2*i] | (raw[2*i+1] << 8);
+                uint32_t f32bits = (uint32_t)bits << 16;
+                float f; 
+                std::memcpy(&f, &f32bits, 4);
+                fprintf(stderr, "%.6f ", f);
+            }
+            fprintf(stderr, "\n");
+        }
+        // Layer 0 attention output (og), the bf16 result of attn_fin_impl for each
+        // head. Lives in act_[0] at offset AD_OG. For Nanbeige4.1-3B-NPU2 (hidden
+        // 2560, NH 20, HD 128, KVH 4):
+        //   AD_OG = AD_XN + XN_ELEMS*ELEM + QW*4 + 2*KVW*4
+        //         = 0 + 2*4096 + 2560*4 + 2*512*4 = 22528
+        // 16 values = head 0's dims 0..15. Compare q8 vs bf16: if these match
+        // (within bf16 rounding), attention is correct and the bug is downstream
+        // (FFN, lm_head); if they diverge, attention is wrong and it's in dequant
+        // or attn_row_impl's q8 path.
+        act_[0].sync(XCL_BO_SYNC_BO_FROM_DEVICE, 22528 + 5120, 0);
+        const uint8_t* act_bytes = act_[0].map<uint8_t*>();
+        constexpr size_t AD_OG = 22528;
+        fprintf(stderr, "layer 0 og[0..15] (bf16): ");
+        for (int i = 0; i < 16; ++i) {
+            uint16_t bits = (uint16_t)act_bytes[AD_OG + 2*i]
+                          | ((uint16_t)act_bytes[AD_OG + 2*i + 1] << 8);
+            uint32_t f32bits = (uint32_t)bits << 16;
+            float f; std::memcpy(&f, &f32bits, 4);
+            fprintf(stderr, "%.5f ", f);
+        }
+        fprintf(stderr, "\n");
+        fprintf(stderr, "=== end dump ===\n\n");
+    }
     if (want_logits) {
         if (cfg_.verbose) {
             xres.sync(XCL_BO_SYNC_BO_FROM_DEVICE, w_->hidden * 4, 0);
