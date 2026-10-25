@@ -69,7 +69,7 @@ from .spec import DENSE, DENSE_LOCAL, ModelSpec
 # Only the ROW SIZE and the kernel flag change -- no runtime switch, no Python-to-kernel
 # plumbing, one export per quant choice. Block size is 32 throughout, matching the weight
 # quantizer so the inner dequant reuses the block law the pool packer already documents.
-KV_QUANT = "bf16"  # "bf16" | "q8" | "q4_1"
+KV_QUANT = "q8"  # "bf16" | "q8" | "q4_1"
 KV_BLOCK = 32
 # Cached rows per attention kernel call, lowered only when the cache is quantized.
 # bf16 keeps the family's own RB (attnknobs.py; 4 for llama3, 8 for others) so the
