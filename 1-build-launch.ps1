@@ -77,5 +77,6 @@ $m = Get-Content .\src\xclbins\Nanbeige4.1-3B-NPU2\open_kernels\manifest.json -R
 cmake --build --preset windows-vs18 --target oflm
 
 # 8. Launch the server
-$env:OFLM_DUMP_KV="1" # Debug
-.\build-vs18\src\oflm.exe serve nanbeige4.1:3b --host 10.0.10.10 --port 52632 --ctx-len 4096 --pmode turbo --quiet
+$env:OFLM_DUMP_KV="0" # Debug
+# .\build-vs18\src\oflm.exe serve nanbeige4.1:3b --host 10.0.10.10 --port 52632 --ctx-len 4096 --pmode turbo --quiet
+.\build-vs18\src\oflm.exe serve ornith1.5:9b --host 10.0.10.10 --port 52632 --ctx-len 262144 --pmode turbo --quiet
