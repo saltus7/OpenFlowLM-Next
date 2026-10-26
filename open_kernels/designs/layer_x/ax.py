@@ -52,6 +52,7 @@ sys.path.insert(0, str(HERE))
 from ironutil import Pipeline, include_dirs  # noqa: E402
 from layout import (AA_BYTES, AA_H, AA_HP, AA_KVN, AA_OG, AA_OUT, AA_OUT2, AA_OUT2B, AA_QG, AA_RES, AA_ROUT,  # noqa: E402
                     AA_XM, AA_XN, CA_BYTES, CA_LNW, CA_META, CA_POSTLN, CA_RW, CA_SGW, ELN, KV_BYTES,
+                    KV_QUANT, KV_ELEM_BYTES,
                     KV_ROW, POOL_BYTES, POOL_FFN_DOWN, POOL_FFN_GATE, POOL_FFN_UP, POOL_GATE, POOL_K,
                     POOL_O, POOL_Q, POOL_V, PTAB_BYTES, PTAB_ROW, R, SPEC)
 import xcommon as X  # noqa: E402
@@ -99,7 +100,7 @@ def ax(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, pa
     # ---- fifos
     of_w, of_y, of_x = XL.main_fifos(t)
     of_lni, of_lno = XL.ln_fifos(tl)
-    of_ain, of_aout, of_og = XL.attn_fifos(a)
+    of_ain, of_aout, of_og, of_akv = XL.attn_fifos(a)
 
     def main_body(win, xin, yout, *args):
         B, K = X.unpack_args(args)
@@ -122,14 +123,18 @@ def ax(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, pa
         X.moe_body(win, xin, yout, B, K)
 
     workers = ([XL.ln_worker(of_lni, of_lno, tl, L)] + XL.main_workers(main_body, of_w, of_x, of_y, t, K)
-               + XL.attn_workers(of_ain, of_aout, of_og, a, afns))
+               + XL.attn_workers(of_ain, of_aout, of_og, of_akv, a, afns))
 
     bt = X.bt
 
     def dense_sequence(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, lni, lno, w_prods, x_prod, y_conss,
-                       ain_p, aout_c, og_cs):
+                       ain_p, akv_p, aout_c, og_cs):
         """ONE instruction stream: the MoE stream's attention half with the router dropped,
-        then designs/dense/dx.py's steps 5-7 (residual + norm, the FFN, the output residual)."""
+        then designs/dense/dx.py's steps 5-7 (residual + norm, the FFN, the output residual).
+
+        akv_p is the KV-window fill's producer (a separate of_akv when QKV, else ain_p).
+        Only the KV fill uses it: the projection stream (q/gate/k/v, og, gate) stays on
+        ain_p under every quant, because those element sizes never changed."""
         tg_ln = TaskGroup()
         lni.fill(c_xres, tap=bt(HID, 0, HID), wait=True, group=tg_ln)
         lni.fill(a_consts, tap=bt(CA_BYTES, CA_LNW, ELN), wait=True, group=tg_ln)
@@ -147,16 +152,22 @@ def ax(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, pa
             py.drain(y_conss[c], a_act, bt(AA_BYTES, *y_regions(c)[3]))
         pa_out, pa_in = Pipeline(3), Pipeline(3)
         pa_out.drain(aout_c, a_kv, bt(KV_BYTES, KV_ROW, KV_ROW))        # the new row [k' | v'] (attnpos)
-        pa_out.drain(aout_c, a_act, bt(AA_BYTES, AA_OG, NHL * HD * 2))
-        for c in range(1, ACORES):                                      # heads NHL*c ..
-            pa_out.drain(og_cs[c - 1], a_act, bt(AA_BYTES, AA_OG + c * NHL * HD * 2, NHL * HD * 2))
+        if KV_QUANT == "bf16":
+            # bf16: aout carries KV AND core 0's og (same b512 element, one fifo does both).
+            pa_out.drain(aout_c, a_act, bt(AA_BYTES, AA_OG, NHL * HD * 2))
+            for c in range(1, ACORES):
+                pa_out.drain(og_cs[c - 1], a_act, bt(AA_BYTES, AA_OG + c * NHL * HD * 2, NHL * HD * 2))
+        else:
+            # q8/q4_0: aout is brow (KV only); every core's og drains from its own og fifo.
+            for c in range(ACORES):
+                pa_out.drain(og_cs[c], a_act, bt(AA_BYTES, AA_OG + c * NHL * HD * 2, NHL * HD * 2))
         pa_in.fill(ain_p, a_consts, bt(CA_BYTES, CA_META, D.E_A))       # [qn | kn]
         pa_in.fill(ain_p, a_ptab, bt(PTAB_BYTES, PTAB_ROW, PTAB_ROW))   # the position record (attnpos)
         py.finish(*y_conss)                                       # q, gate, k, v are in DDR
         pa_in.fill(ain_p, a_act, bt(AA_BYTES, AA_QG, QW * 4))
         pa_in.fill(ain_p, a_act, bt(AA_BYTES, AA_KVN, KVW * 4))
         pa_in.fill(ain_p, a_act, bt(AA_BYTES, AA_KVN + KVW * 4, KVW * 4))
-        pa_in.fill(ain_p, a_kv, bt(KV_BYTES, 0, KV_ROW))                # the window: rows [0, nf) (attnpos)
+        pa_in.fill(akv_p if KV_QUANT != "bf16" else ain_p, a_kv, bt(KV_BYTES, 0, KV_ROW))   # window: rows [0, nf) (attnpos)
         pa_in.fill(ain_p, a_act, bt(AA_BYTES, AA_QG + QW * 4, QW * 4))
         for c in range(N_CORES):
             pw.fill(w_prods[c], a_pool, bt(POOL_BYTES, *w_regions(c)[4]))
@@ -197,24 +208,39 @@ def ax(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, pa
         px.finish()
         pa_in.finish()
 
-    def sequence(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, lni, lno, w_prods, x_prod, y_conss, ain_p, aout_c, og_cs):
+    def sequence(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, lni, lno, w_prods, x_prod, y_conss, ain_p, akv_p, aout_c, og_cs):
         if DENSE:
             dense_sequence(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, lni, lno, w_prods, x_prod, y_conss,
-                           ain_p, aout_c, og_cs)
+                           ain_p, akv_p, aout_c, og_cs)
         elif part == 0:
             XL.full_sequence(a_pool, c_xres, a_consts, a_kv, a_act, a_ptab, lni, lno, w_prods, x_prod, y_conss,
-                             ain_p, aout_c, og_cs)
+                             ain_p, akv_p, aout_c, og_cs)
         else:
             X.moe_sequence(Pipeline(3), Pipeline(3), Pipeline(3), a_pool, a_consts, a_act, c_xres, w_prods, x_prod, y_conss,
                            AA_BYTES, CA_BYTES, AA_XM, AA_ROUT, AA_RES, AA_HP, CA_SGW)
 
+    # akv_p is passed in the same position for both quantizations: None when bf16 (the KV
+    # window fill goes to ain_p and akv_p is ignored, matching sequence()'s conditional),
+    # and of_akv.prod on Tile(7, 0) when the cache is quantized. Tile(7, 0) is the one shim
+    # column with a free MM2S channel at every ACORES this design can select for (ACORES is
+    # a divisor of NH / HPO, so with NH=16, HPO=4, ACORES in {1, 2, 4}; og consumers span
+    # Tiles 3..5 at most, leaving 6 and 7 free -- 7 chosen to mirror dx_attn.py).
+    akv_prod = [of_akv.prod(tile=Tile(7, 0))] if of_akv is not None else [None]
+    # og consumers: bf16 has ACORES-1 (core 0 shares aout with KV); QKV has ACORES (each
+    # core drains its own og). Tiles 3..3+ACORES-1 S2MM sit beside the same tiles' MM2S
+    # (of_w[c] on channel 0, og[c] on channel 1), which IRON allocates cleanly.
+    if KV_QUANT != "bf16":
+        og_cons = [of_og[c].cons(tile=Tile(3 + c, 0)) for c in range(ACORES)]
+    else:
+        og_cons = [of_og[c].cons(tile=Tile(3 + c, 0)) for c in range(ACORES - 1)]
     rt = Runtime(sequence, [pool_ty, xres_ty, consts_ty, kv_ty, act_ty, ptab_ty,
                             of_lni.prod(tile=Tile(0, 0)), of_lno.cons(tile=Tile(0, 0)),
                             [of_w[c].prod(tile=Tile(c, 0)) for c in range(N_CORES)],
                             of_x.prod(tile=Tile(1, 0)),
                             [of_y[c].cons(tile=Tile(c, 0)) for c in range(N_CORES)],
-                            of_ain.prod(tile=Tile(2, 0)), of_aout.cons(tile=Tile(1, 0)),
-                            [of_og[c].cons(tile=Tile(3 + c, 0)) for c in range(ACORES - 1)]])
+                            of_ain.prod(tile=Tile(2, 0))] + akv_prod + [
+                            of_aout.cons(tile=Tile(1, 0)),
+                            og_cons])
     return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
 
 

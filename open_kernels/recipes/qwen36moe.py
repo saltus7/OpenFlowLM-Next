@@ -29,6 +29,36 @@ from .attnknobs import knobs as attn_knobs, probe_env as _attn_probe_env
 from .spec import FULL, LINEAR, QUANT_FORMATS, ModelSpec
 
 
+# ---- KV cache quantization ------------------------------------------------------------
+# Runtime-switchable by editing this constant and re-running export_qwen36_kernels.py.
+#   "bf16" -- the original (K_t bf16 | V_t bf16 = 2 * e_a bytes per row)
+#   "q8"   -- 34 B per 32-value block: bf16 scale + 32 int8 codes
+#   "q4_0" -- 18 B per 32-value block: bf16 scale + 16 packed signed int4 codes
+# Same block-of-32 law as recipes/dense.py's KV_QUANT (the two constants are independent
+# since dense and qwen36moe are separate families, but the byte layout is identical).
+KV_QUANT = "q4_0"   # "bf16" | "q8" | "q4_0"
+KV_BLOCK = 32
+# Cached rows per attention kernel call when quantized. Mirrors recipes/dense.py's
+# KV_RB_QUANTIZED: RB=1 retires attn_stepb entirely (BLOCK cannot be on at RB < 2,
+# attn.h's #error enforces it), so only the single-row kernel is built.
+KV_RB_QUANTIZED = 1
+
+
+def _kv_elem_bytes(e_a: int) -> int:
+    """One K row (or V row) in the chosen KV format, given one bf16 K row (e_a bytes).
+    Mirrors recipes/dense.py's derivation so the two families' KV caches are byte-
+    compatible."""
+    if KV_QUANT == "bf16":
+        return e_a
+    if KV_QUANT == "q8":
+        nblk = e_a // 2 // KV_BLOCK
+        return nblk * (2 + KV_BLOCK)
+    if KV_QUANT == "q4_0":
+        nblk = e_a // 2 // KV_BLOCK
+        return nblk * (2 + KV_BLOCK // 2)
+    raise OpRangeError(f"qwen36moe: unknown KV_QUANT {KV_QUANT!r} (have bf16, q8, q4_0)")
+
+
 def one_context() -> bool:
     """The decode layer loop as ONE hardware context: the two whole-layer designs merged into
     designs/layer_x/ux.py's four instruction streams over one image (OPEN-DECODE-ONE-CONTEXT).
@@ -300,7 +330,7 @@ class Layout:
     POOL_DOWN: int; POOL_SHARE_UP: int; POOL_SHARE_GATE: int; POOL_SHARE_DOWN: int
     POOL_BYTES: int
     # KV cache / position table
-    KV_ROW: int; PTAB_ROW: int; MAX_CTX: int; KV_BYTES: int; PTAB_BYTES: int
+    KV_ROW: int; KV_ELEM_BYTES: int; KV_QUANT: str; PTAB_ROW: int; MAX_CTX: int; KV_BYTES: int; PTAB_BYTES: int
     # lm_head
     LMHEAD_POOL_BYTES: int; LMHEAD_BAND_BYTES: int; LMHEAD_BANDS: int
     # element sizes: the norm helper's (HID*2) and the attention helper's (one KV row half)
@@ -740,10 +770,14 @@ def layout(spec: ModelSpec, max_ctx: int = 4096, ffn: str = "moe") -> Layout:
         a.add("hp", ELEM)
         kv.update(AA_XN=a.off["xn"], AA_QG=a.off["qg"], AA_KVN=a.off["kvn"], AA_OG=a.off["og"], AA_OUT=a.off["out"],
                   AA_RES=a.off["res"], AA_XM=a.off["xm"], AA_ROUT=a.off["rout"], AA_HP=a.off["hp"], AA_BYTES=a.n)
-        kv_row = 2 * kvw * 2                           # [K_t bf16 | V_t bf16]
+        e_a = kvw * 2                                  # one bf16 K row (attention element size)
+        kv_elem = _kv_elem_bytes(e_a)                  # one K row in the chosen format
+        kv_row = 2 * kv_elem                           # [K_t | V_t] pair
     else:
         kv.update({k: 0 for k in ("CA_LNW", "CA_POSTLN", "CA_META", "CA_RW", "CA_SGW", "CA_BYTES", "AA_XN", "AA_QG",
                                   "AA_KVN", "AA_OG", "AA_OUT", "AA_RES", "AA_XM", "AA_ROUT", "AA_HP", "AA_BYTES")})
+        e_a = 0
+        kv_elem = 0
         kv_row = 0
 
     # ---- the layer pool: experts first (routed up/gate stripes, routed down, shared), then the projections
@@ -784,9 +818,10 @@ def layout(spec: ModelSpec, max_ctx: int = 4096, ffn: str = "moe") -> Layout:
     # (the closed engine's size, 517 MB for the 27B); the design streams exactly `bands`.
     band = 128 * hid // CHUNK_VALUES * Q8_CHUNK
     bands = spec.vocab // 128
-    kv.update(KV_ROW=kv_row, PTAB_ROW=PTAB_ROW, MAX_CTX=max_ctx, KV_BYTES=max_ctx * kv_row, PTAB_BYTES=max_ctx * PTAB_ROW,
+    kv.update(KV_ROW=kv_row, KV_ELEM_BYTES=kv_elem, KV_QUANT=KV_QUANT, PTAB_ROW=PTAB_ROW, MAX_CTX=max_ctx,
+              KV_BYTES=max_ctx * kv_row, PTAB_BYTES=max_ctx * PTAB_ROW,
               LMHEAD_POOL_BYTES=roundup(roundup(bands, n) * band, MB), LMHEAD_BAND_BYTES=band, LMHEAD_BANDS=bands,
-              ELN=hid * 2, E_A=kv_row // 2)
+              ELN=hid * 2, E_A=e_a)
     return Layout(**kv)
 
 
@@ -852,10 +887,12 @@ def _layout_dense(spec: ModelSpec, max_ctx: int = 4096) -> Layout:
                                   "A_ROUT", "A_HP", "A_H", "A_OUT2", "A_BYTES", "S_ROWS", "S_HEAD_BYTES",
                                   "STATE_S_OFF", "STATE_BYTES")})
 
-    e_a, kv_row = 0, 0
+    e_a, kv_elem, kv_row = 0, 0, 0
     if spec.has_full:
         qw, kvw, hd = spec.attn_q_width, spec.attn_kv_width, spec.head_dim
-        e_a, kv_row = kvw * 2, 4 * kvw
+        e_a = kvw * 2                                     # one bf16 K row (attention element size)
+        kv_elem = _kv_elem_bytes(e_a)                     # one K row in the chosen format
+        kv_row = 2 * kv_elem                              # [K_t | V_t] pair
         og_att = roundup(qw * 2, ELEM) // ELEM * ELEM
         c = _Alloc()
         c.add("lnw", eln)
@@ -929,8 +966,8 @@ def _layout_dense(spec: ModelSpec, max_ctx: int = 4096) -> Layout:
                            f"{e_a}-byte attention element (see recipes/dense.py _ptab_check)")
     band = 128 * hid // CHUNK_VALUES * Q8_CHUNK
     bands = spec.vocab // 128
-    kv.update(KV_ROW=kv_row, PTAB_ROW=ptab_row, MAX_CTX=max_ctx, KV_BYTES=max_ctx * kv_row,
-              PTAB_BYTES=max_ctx * ptab_row,
+    kv.update(KV_ROW=kv_row, KV_ELEM_BYTES=kv_elem, KV_QUANT=KV_QUANT, PTAB_ROW=ptab_row, MAX_CTX=max_ctx,
+              KV_BYTES=max_ctx * kv_row, PTAB_BYTES=max_ctx * ptab_row,
               LMHEAD_POOL_BYTES=roundup(roundup(bands, n) * band, MB), LMHEAD_BAND_BYTES=band,
               LMHEAD_BANDS=bands, ELN=eln, E_A=e_a)
     return Layout(**kv)
@@ -968,6 +1005,15 @@ def attn(spec: ModelSpec) -> Attn | None:
     e_a = kvw * 2                                 # one cache-row half, attn.h's fifo element
     hpe, hpo = e_a // (hd * 4), e_a // (hd * 2)   # f32 heads per q/k/v/gate element; bf16 heads per og element
     A = attn_knobs(spec, spec.num_heads, hpo)
+    # A quantized cache turns every cached-row read into a dequant sequence, and
+    # attn_rowb_impl unrolls that across (head, row, block). RB=1 retires the block
+    # kernel entirely (attn.h's #error enforces ATTN_BLOCK_ONLY needs RB >= 2). Mirrors
+    # recipes/dense.py. E_A stays at the bf16 element size: only the KV row changes.
+    rb = A.RB
+    blk = A.BLOCK
+    if KV_QUANT != "bf16":
+        rb = KV_RB_QUANTIZED
+        blk = 0
     return Attn(
         NH=spec.num_heads, KVH=spec.num_kv_heads, HD=hd, ROT=spec.rotary_dim,
         Q_PC=qw // BAND_ROWS // n, KV_PC=kvw // BAND_ROWS // n, O_PC=spec.hidden // BAND_ROWS // n,
@@ -977,7 +1023,7 @@ def attn(spec: ModelSpec) -> Attn | None:
         Q_AIN_ELEMS=spec.num_heads // hpe, K_AIN_ELEMS=spec.num_kv_heads // hpe,
         OG_AOUT_ELEMS=spec.num_heads // hpo,
         OG_ELEMS=roundup(qw * 2, ELEM) // ELEM,
-        VEXP=A.VEXP, MLS=A.MLS, ACORES=A.ACORES, NHL=A.NHL, RB=A.RB, BLOCK=A.BLOCK,
+        VEXP=A.VEXP, MLS=A.MLS, ACORES=A.ACORES, NHL=A.NHL, RB=rb, BLOCK=blk,
     )
 
 
@@ -1473,7 +1519,8 @@ def manifest_layout(spec: ModelSpec, max_ctx: int) -> dict:
         "hidden": spec.hidden, "vocab": spec.vocab, "real_vocab": spec.real_vocab,
         "chunk_bytes": CHUNK, "pool_bytes": L.POOL_BYTES,
         "lmhead_pool_bytes": L.LMHEAD_POOL_BYTES, "lmhead_chunk_bytes": Q8_CHUNK,
-        "kv_row": L.KV_ROW, "ptab_row": L.PTAB_ROW, "rotary_dim": spec.rotary_dim, "rope_theta": spec.rope_theta,
+        "kv_row": L.KV_ROW, "kv_quant": KV_QUANT, "kv_block": KV_BLOCK,
+        "ptab_row": L.PTAB_ROW, "rotary_dim": spec.rotary_dim, "rope_theta": spec.rope_theta,
         "rope_inv_freq": spec.rope_inv_freq(),
         "rout_idx_off": ROUT_IDX_OFF,
         "moe": {"experts": spec.num_experts, "topk": spec.experts_per_tok,

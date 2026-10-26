@@ -206,7 +206,18 @@ static constexpr unsigned kNL = kNHL >= 8 ? kNHL : 8;
 // 16 KB of program memory (Gemma3-4B, 2026-09-08: "Overflow of program memory", at RB 4
 // and at RB 2), so there they unroll by four. HD 64 / 128 compile what they compiled.
 #if ATTN_HD <= 128
+#if defined(ATTN_UNROLL_REDUCED)
+// Quant dequant code at HD 128 fully-unrolls the 4-iteration score/PV dot product,
+// multiplying the dequant call-site code by 4. On a 16 KB core that leaves no room
+// for the K/V cache-write and step-side branch that q4_0/q8 adds. The flag is set
+// ONLY by xlayer.py (the MoE/whole-layer designs), so:
+//   - the dense path (designs/dense/dx.py) keeps FULL unroll and Nanbeige's speed
+//   - ax0/ax1 shrink at the cost of ~10-15% attention time when the dequant path
+//     is on the critical path (which it is when q4_0/q8 is in the cache)
+#define ATTN_UNROLL_HD _Pragma("clang loop unroll_count(2)")
+#else
 #define ATTN_UNROLL_HD AIE_LOOP_UNROLL_FULL
+#endif
 #else
 #define ATTN_UNROLL_HD _Pragma("clang loop unroll_count(4)")
 #endif
@@ -570,18 +581,50 @@ static void quant_kv_row(const float *__restrict src, kvout_t *__restrict dst) {
     #elif defined(KV_QUANT_Q4_0)
         // Symmetric q4_0: d = amax / 7, signed codes [-7, 7] stored as (code + 8) in [1, 15].
         // Both extremes reproduce exactly; code 0 (would be -8) is unused (6% precision waste).
+        //
+        // ATTN_INTFP=1: route the division through scalar_fp.h's integer reciprocal, the
+        // same trick norm_rope and attn_fin_impl already use. Without this the q4_0 branch
+        // still calls compiler-rt's __divsf3 (a whole softfloat division routine, several
+        // hundred bytes) — INTFP's memory savings never materialize because the routine
+        // stays linked in from this call site. amax/7.0f becomes amax * (1/7.0f) rounded
+        // through smul_rn, and 1.0f/d_r becomes srecip_rn(d_r): both IEEE round-nearest,
+        // same results bit for bit (utilities/scalar_fp_test.cpp).
         float amax = 0.0f;
         #pragma clang loop unroll(disable)
         for (unsigned i = 0; i < 32; ++i) { const float a = b[i] < 0.0f ? -b[i] : b[i]; if (a > amax) amax = a; }
+#if ATTN_INTFP
+        const uint16_t d_bits = f32_to_bf16_rne_bits(smul_rn(amax, 1.0f / 7.0f));
+#else
         const uint16_t d_bits = f32_to_bf16_rne_bits(amax / 7.0f);
+#endif
         write_u16(dst + 2 * bi, d_bits);
         const float d_r = bf16_bits_to_f32(d_bits);
+#if ATTN_INTFP
+        const float inv = d_r > 0.0f ? srecip_rn(d_r) : 0.0f;
+#else
         const float inv = d_r > 0.0f ? 1.0f / d_r : 0.0f;
+#endif
         uint8_t *codes = dst + 2 * kKVNBlk + bi * 16;
         #pragma clang loop unroll(disable)
         for (unsigned i = 0; i < 16; ++i) {
+#if ATTN_INTFP
+            // The multiply here was pulling compiler-rt's __mulsf3 back into the linked
+            // program (32 calls per block x 4 blocks x kHPE heads x every row, every layer,
+            // every token). smul_rn is the same IEEE round-nearest multiply as __mulsf3,
+            // but inline integer Newton iteration -- no library routine, ~300-400 B less
+            // text in the attention core's program. Same results bit for bit (attn.h
+            // header, utilities/scalar_fp_test.cpp). The +0.5 rounding add still goes
+            // through __addsf3 (smallest of the three softfloat routines); that one is
+            // left alone -- a further win would need sadd_rn which scalar_fp.h does not
+            // provide.
+            const float p0 = smul_rn(b[2 * i], inv);
+            const float p1 = smul_rn(b[2 * i + 1], inv);
+            int q0 = (int)(p0 + (b[2 * i]     >= 0.0f ? 0.5f : -0.5f));
+            int q1 = (int)(p1 + (b[2 * i + 1] >= 0.0f ? 0.5f : -0.5f));
+#else
             int q0 = (int)(b[2 * i]     * inv + (b[2 * i]     >= 0.0f ? 0.5f : -0.5f));
             int q1 = (int)(b[2 * i + 1] * inv + (b[2 * i + 1] >= 0.0f ? 0.5f : -0.5f));
+#endif
             if (q0 < -7) q0 = -7; if (q0 > 7) q0 = 7;
             if (q1 < -7) q1 = -7; if (q1 > 7) q1 = 7;
             codes[i] = (uint8_t)((q0 + 8) | ((q1 + 8) << 4));

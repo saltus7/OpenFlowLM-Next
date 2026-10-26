@@ -67,10 +67,10 @@ cd C:\Users\user\lyb-llm-host\projects\OpenFlowLM-Next
 Remove-Item -Path .\open_kernels\designs\dense\build_* -Recurse -Force -ErrorAction SilentlyContinue
 
 # 5. Export the kernels
-python .\open_kernels\export_qwen36_kernels.py --model-dir "$env:USERPROFILE\.oflm\models\Nanbeige4.1-3B-NPU2" --force
+python .\open_kernels\export_qwen36_kernels.py --model-dir "$env:USERPROFILE\.flm\models\Ornith-1.5-9B-NPU2" --force
 
 # 6. Verify manifest settings
-$m = Get-Content .\src\xclbins\Nanbeige4.1-3B-NPU2\open_kernels\manifest.json -Raw | ConvertFrom-Json
+$m = Get-Content .\src\xclbins\Ornith-1.5-9B-NPU2\open_kernels\manifest.json -Raw | ConvertFrom-Json
 "kv_row = $($m.layout.kv_row), kv_quant = $($m.layout.kv_quant)"   # expect 1088, q8
 
 # 7. Build the project
@@ -79,4 +79,5 @@ cmake --build --preset windows-vs18 --target oflm
 # 8. Launch the server
 $env:OFLM_DUMP_KV="0" # Debug
 # .\build-vs18\src\oflm.exe serve nanbeige4.1:3b --host 10.0.10.10 --port 52632 --ctx-len 4096 --pmode turbo --quiet
-.\build-vs18\src\oflm.exe serve ornith1.5:9b --host 10.0.10.10 --port 52632 --ctx-len 262144 --pmode turbo --quiet
+# .\build-vs18\src\oflm.exe serve ornith1.5:9b --host 10.0.10.10 --port 52632 --ctx-len 4096 --pmode turbo --quiet
+.\build-vs18\src\oflm.exe serve ornith15moe:35b --host 10.0.10.10 --port 52632 --ctx-len 4096 --pmode turbo --quiet

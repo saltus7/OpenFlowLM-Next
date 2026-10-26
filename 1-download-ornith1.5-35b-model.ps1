@@ -1,0 +1,1 @@
+python ./utilities/oflm-add/oflm-add.py Atomic-Germ/Ornith-1.5-35B-A3B-NPU2 --tag ornith1.5:35b-a3b --family qwen3.6-moe --system-list "C:/Users/user/lyb-llm-host/projects/OpenFlowLM-Next/src/model_list.json"

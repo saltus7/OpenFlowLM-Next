@@ -312,7 +312,8 @@ def manifest_layout(spec: ModelSpec, max_ctx: int) -> dict:
         "hidden": spec.hidden, "vocab": spec.vocab, "real_vocab": spec.real_vocab,
         "chunk_bytes": CHUNK, "pool_bytes": L.POOL_BYTES,
         "lmhead_pool_bytes": L.LMHEAD_POOL_BYTES, "lmhead_chunk_bytes": Q8_CHUNK,
-        "kv_row": L.KV_ROW, "ptab_row": L.PTAB_ROW, "rotary_dim": spec.rotary_dim,
+        "kv_row": L.KV_ROW, "kv_quant": M.KV_QUANT, "kv_block": M.KV_BLOCK,
+        "ptab_row": L.PTAB_ROW, "rotary_dim": spec.rotary_dim,
         "rope_theta": spec.rope_theta, "rope_inv_freq": spec.rope_inv_freq(),
     }
 

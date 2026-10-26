@@ -2030,15 +2030,23 @@ void Core::step_impl(int token, const float* x, bool want_logits, const int64_t*
         timing_.part1_ms += blocked;
         timing_.dispatch_ms += elapsed;
     }
-    // Debug KV dump, gated by env var. Fires once: layer 0, pos 0.
-    // At this point, all layer dispatches for this token have completed and synced.
+    // Debug KV dump, gated by env var. Fires once per position of interest.
+    // Finds the first attention layer rather than assuming layer 0: hybrid models
+    // (Ornith, Qwen3.5, 35B) start with linear_attention layers that hold SSM state,
+    // not KV. Uses std::vector so any kv_row fits (q4_0 = 576, q8 = 1088, bf16 = 2048+).
     if ((pos_ == 0 || pos_ == 26) && std::getenv("OFLM_DUMP_KV")) {
-        uint16_t k_buf[2048 / 2]; 
-        kv_row(0, static_cast<int>(pos_), false, k_buf); // layer 0, row pos_, K (false = not V)
-        
-        const uint8_t* raw = reinterpret_cast<const uint8_t*>(k_buf);
-        fprintf(stderr, "\n=== OFLM_DUMP_KV: layer 0, pos %d ===\n", static_cast<int>(pos_));
-        fprintf(stderr, "man_.kv_row=%zu\n", man_.kv_row);
+        int dump_layer = -1;
+        for (int l = 0; l < static_cast<int>(nl_); ++l) {
+            if (is_attention_layer(l)) { dump_layer = l; break; }
+        }
+        if (dump_layer < 0) {
+            fprintf(stderr, "\n=== OFLM_DUMP_KV: no attention layers (all linear) ===\n");
+        } else {
+            std::vector<uint16_t> k_buf(man_.kv_row / 2);
+            kv_row(dump_layer, static_cast<int>(pos_), false, k_buf.data());
+            const uint8_t* raw = reinterpret_cast<const uint8_t*>(k_buf.data());
+            fprintf(stderr, "\n=== OFLM_DUMP_KV: layer %d, pos %d ===\n", dump_layer, static_cast<int>(pos_));
+            fprintf(stderr, "man_.kv_row=%zu\n", man_.kv_row);
 
         if (man_.kv_row == 1088) { // Q8 path
             fprintf(stderr, "q8 scales (first 4 bf16 values): ");
@@ -2101,7 +2109,8 @@ void Core::step_impl(int token, const float* x, bool want_logits, const int64_t*
             fprintf(stderr, "%.5f ", f);
         }
         fprintf(stderr, "\n");
-        fprintf(stderr, "=== end dump ===\n\n");
+            fprintf(stderr, "=== end dump ===\n\n");
+        }
     }
     if (want_logits) {
         if (cfg_.verbose) {

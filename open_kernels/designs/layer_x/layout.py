@@ -73,9 +73,15 @@ POOL_DOWN, POOL_SHARE_UP, POOL_SHARE_GATE, POOL_SHARE_DOWN = (_L.POOL_DOWN, _L.P
                                                               _L.POOL_SHARE_DOWN)
 POOL_BYTES = _L.POOL_BYTES
 
-# the KV cache and the position record table (the driver reads them from manifest.json)
+# the KV cache and the position record table (the driver reads them from manifest.json).
+# KV_QUANT and KV_ELEM_BYTES drive the design-side branching: bf16 keeps the pre-existing
+# single-row kernel signatures and the ain fifo for cached-row traffic; q8/q4_0 route that
+# traffic through a dedicated of_akv fifo whose element is one packed K (or V) row, because
+# the packed row (KV_ROW = 2 * KV_ELEM_BYTES) does not tile into the attention element
+# (E_A = one bf16 row, kKVH * kHD * 2). Same pattern as designs/dense/dx.py.
 KV_ROW, PTAB_ROW, MAX_CTX = _L.KV_ROW, _L.PTAB_ROW, _L.MAX_CTX
 KV_BYTES, PTAB_BYTES = _L.KV_BYTES, _L.PTAB_BYTES
+KV_QUANT, KV_ELEM_BYTES = _L.KV_QUANT, _L.KV_ELEM_BYTES
 LMHEAD_POOL_BYTES = _L.LMHEAD_POOL_BYTES
 
 
