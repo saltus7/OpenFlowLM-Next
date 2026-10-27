@@ -29,6 +29,7 @@ merged values describe the same transfers.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -397,6 +398,11 @@ if A is not None:
         # time; saves ~100-300 B per site x 2 sites in attn_row_impl. Only in this
         # design's flags, so Nanbeige (dense/dx.py) is untouched.
         ATTN_FLAGS.append("-DATTN_UNROLL_REDUCED=1")
+        # ATTN_UNROLL_MINIMAL: full unroll-disable on the HD loop when the reduced form
+        # alone did not fit. Set via OFLM_ATTN_UNROLL_MINIMAL=1 in the environment --
+        # keeps the default reduced-only build for any model that fits at count(2).
+        if os.environ.get("OFLM_ATTN_UNROLL_MINIMAL") == "1":
+            ATTN_FLAGS.append("-DATTN_UNROLL_MINIMAL=1")
     for _k, _v in probe_env().items():                     # ATTN_NULL / ATTN_ABL: see attn.h. In the build key.
         if _k not in ("ATTN_RB", "ATTN_FAST"):             # RB is in the flags above via A.RB; FAST picks A itself.
             ATTN_FLAGS.append(f"-D{_k}={_v}")

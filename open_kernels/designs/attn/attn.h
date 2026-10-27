@@ -212,9 +212,12 @@ static constexpr unsigned kNL = kNHL >= 8 ? kNHL : 8;
 // for the K/V cache-write and step-side branch that q4_0/q8 adds. The flag is set
 // ONLY by xlayer.py (the MoE/whole-layer designs), so:
 //   - the dense path (designs/dense/dx.py) keeps FULL unroll and Nanbeige's speed
-//   - ax0/ax1 shrink at the cost of ~10-15% attention time when the dequant path
+//   - ax0/ax1 shrink at the cost of ~15-25% attention time when the dequant path
 //     is on the critical path (which it is when q4_0/q8 is in the cache)
-#define ATTN_UNROLL_HD _Pragma("clang loop unroll_count(2)")
+// unroll(disable) rather than unroll_count(1): they are semantically different on
+// clang -- unroll_count(1) is a hint, unroll(disable) is an instruction. The AIE
+// clang backend honours only the second.
+#define ATTN_UNROLL_HD _Pragma("clang loop unroll(disable)")
 #else
 #define ATTN_UNROLL_HD AIE_LOOP_UNROLL_FULL
 #endif
@@ -533,8 +536,13 @@ static constexpr unsigned kKVHeadBytes = kKVNBlk * kKVBlockBytes;
 // noinline so the body appears ONCE in the linked program (called from both attn_k_impl
 // and attn_v_impl); with the outer loop also un-unrolled, its footprint drops from
 // ~4 x 4 = 16 inline copies of the 4-block body to 1 copy plus loop counter.
-__attribute__((noinline))
-static void quant_kv_row(const float *__restrict src, kvout_t *__restrict dst) {
+// External weak linkage (inline at namespace scope) so every TU that includes attn.h
+// sees the SAME function body -- one copy in the linked ELF, not one per TU. The
+// comment above ("noinline so the body appears ONCE") is only true with inline, not
+// with static: static gives internal linkage, so attn_k.cc and attn_v.cc each get
+// their own copy. Matches the pattern norm_rope, attn_row_impl, attn_rowb_impl use.
+__attribute__((noinline)) inline
+void quant_kv_row(const float *__restrict src, kvout_t *__restrict dst) {
     #pragma unroll 1
     for (unsigned bi = 0; bi < kKVNBlk; ++bi) {
         // Force a hard address computation the compiler cannot fold
@@ -633,7 +641,7 @@ static void quant_kv_row(const float *__restrict src, kvout_t *__restrict dst) {
     }
 }
 
-static inline void dequant_kv_block(const kvout_t *__restrict row, unsigned bi,
+__attribute__((noinline)) inline void dequant_kv_block(const kvout_t *__restrict row, unsigned bi,
                                      bfloat16 *__restrict dst) {
     // Inner loops un-rolled on purpose: without these pragmas Clang auto-unrolls the
     // 32-value loop below, which, multiplied by 4 blocks a row and 8 call sites in
@@ -693,8 +701,12 @@ static inline void dequant_kv_block(const kvout_t *__restrict row, unsigned bi,
 // it is called for. On Nanbeige's kNHL*kRB path that is a ~16x reduction in
 // the binary size of the dequant block -- the difference between fitting a
 // core's 16 KB of program memory and overflowing it.
-__attribute__((noinline)) static void dequant_kv_row(const kvout_t *__restrict src, bfloat16 *__restrict dst) {
-  #pragma unroll 1
+// Same linkage correction as quant_kv_row: inline (not static) so attn_step.cc and
+// attn_step_new.cc share one definition. The outer block loop uses the explicit
+// clang form (some AIE clang versions ignore "#pragma unroll 1" on the AIE VLIW
+// backend; the clang-specific pragma is honoured).
+__attribute__((noinline)) inline void dequant_kv_row(const kvout_t *__restrict src, bfloat16 *__restrict dst) {
+  #pragma clang loop unroll(disable)
   for (unsigned bi = 0; bi < kKVNBlk; ++bi) dequant_kv_block(src, bi, dst + bi * 32);
 }
 #endif  // KV_QUANT_Q8 || KV_QUANT_Q4_1
@@ -801,9 +813,13 @@ __attribute__((noinline)) inline void attn_row_impl(const kvout_t *__restrict Kt
   // Unrolled only when this is the hot path. With ATTN_RB > 1 it runs for the
   // handful of rows that do not fill a block, and the 8x of code it costs is
   // 8x of the core's 16 KB of program memory that the block kernel needs.
-#if ATTN_RB == 1 && ATTN_HD <= 128
+#if ATTN_RB == 1 && ATTN_HD <= 128 && !defined(ATTN_UNROLL_REDUCED)
   AIE_LOOP_UNROLL_FULL      // at HD 256 four heads unrolled over eight head-dim steps overflow
-#endif                      // program memory (the 35B's ax, 2026-09-08); the loop stays a loop there
+#endif                      // program memory (the 35B's ax, 2026-09-08); the loop stays a loop there.
+                            // Also gated on !ATTN_UNROLL_REDUCED for quantized builds: the per-head
+                            // body now includes a dequant call site, and 4x copies of that is what
+                            // fills the attention core's 16 KB. ATTN_UNROLL_REDUCED is set only
+                            // by xlayer.py when KV_QUANT != "bf16", so bf16 stays byte-identical.
   for (unsigned hl = 0; hl < kNHL; ++hl) {
     const unsigned h = kSplit ? ((unsigned)h0 + hl) : hl;   // folds away when this core owns them all                 // global head: q and the kv mapping
     const unsigned kvh = h / (kNH / kKVH);
@@ -877,9 +893,11 @@ __attribute__((noinline)) inline void attn_row_impl(const kvout_t *__restrict Kt
   // Unrolled only when this is the hot path. With ATTN_RB > 1 it runs for the
   // handful of rows that do not fill a block, and the 8x of code it costs is
   // 8x of the core's 16 KB of program memory that the block kernel needs.
-#if ATTN_RB == 1 && ATTN_HD <= 128
+#if ATTN_RB == 1 && ATTN_HD <= 128 && !defined(ATTN_UNROLL_REDUCED)
   AIE_LOOP_UNROLL_FULL      // at HD 256 four heads unrolled over eight head-dim steps overflow
-#endif                      // program memory (the 35B's ax, 2026-09-08); the loop stays a loop there
+#endif                      // program memory (the 35B's ax, 2026-09-08); the loop stays a loop there.
+                            // Gated on !ATTN_UNROLL_REDUCED for quantized builds -- see the
+                            // score loop's identical gate above.
   for (unsigned hl = 0; hl < kNHL; ++hl) {
     const unsigned kvh = (kSplit ? ((unsigned)h0 + hl) : hl) / (kNH / kKVH);
     const bfloat16 bhh = bh[hl], bll = bl[hl];
@@ -1280,17 +1298,32 @@ __attribute__((noinline)) inline void attn_fin_impl(const float *__restrict oacc
     const float *o = oacc + h * kHD;
 #if ATTN_GATE
     const float *g = (i < kHPE) ? (g0 + i * kHD) : (g1 + (i - kHPE) * kHD);
-#endif
-    for (unsigned j = 0; j < kHD; j += kV) {
-      const v32f on = fscaleN<32>(aie::load_v<kV>(o + j), inv);
-#if ATTN_GATE
-      const v32f r = fmul32(on, vsigmoidN<32>(aie::load_v<kV>(g + j)));
-#else
-      const v32f r = on;
-#endif
-      accf32 a;
+    // The gate's sigmoid is the ONLY caller of vexpN<32> on this core: the row loop's
+    // softmax is kVE-wide (8 for a 4-head core, 16 or 32 for wider ones). Narrowing
+    // here drops vexp<32> / vrecip<32> / vsigmoid<32> -- together ~2.3 KB of the
+    // ~17.4 KB image -- from the link, since attn_fin_impl's gated branch is the only
+    // place they are reached. vexpN is lane-wise, so kVE-wide calls over a 32-float
+    // chunk are bit-identical to one 32-wide call over the same chunk.
+    //
+    // unroll(disable): at HD 256 the compiler would otherwise unroll 32/kVE = 4x more
+    // body than the 32-wide version had (32 iterations vs 8, then unroll_count(4) on
+    // each), which eats most of the savings. Rolled, the body is one vexpN<kVE> call
+    // site.
+    #pragma clang loop unroll(disable)
+    for (unsigned j = 0; j < kHD; j += kVE) {
+      const vfN<kVE> on = fscaleN<kVE>(aie::load_v<kVE>(o + j), inv);
+      const vfN<kVE> r = fmulN<kVE>(on, vsigmoidN<kVE>(aie::load_v<kVE>(g + j)));
+      accN<kVE> a;
       a.from_vector(r);
       aie::store_v(og + i * kHD + j, a.template to_vector<bfloat16>());
     }
+#else
+    for (unsigned j = 0; j < kHD; j += kV) {
+      const v32f on = fscaleN<32>(aie::load_v<kV>(o + j), inv);
+      accf32 a;
+      a.from_vector(on);
+      aie::store_v(og + i * kHD + j, a.template to_vector<bfloat16>());
+    }
+#endif
   }
 }
