@@ -1736,6 +1736,22 @@ void Core::route(Kern& k, int layer, uint64_t act_off) {
     }
     uint32_t idx[8];
     std::memcpy(idx, act.map<uint8_t*>() + off, 32);
+    // VERIFY-ROUTE: logs the router index every time route() reads it, so a cached
+    // continuation that hangs on lx1 has a logged idx for the layer-0 route that is
+    // either valid (lx0 succeeded, hang is lx1's own dispatch) or garbage / stale.
+    // Gated on OFLM_DEBUG_ROUTE so it costs nothing on the normal path. Delete once
+    // the cached-continuation hang is diagnosed.
+    if (std::getenv("OFLM_DEBUG_ROUTE"))
+        std::fprintf(stderr, "VERIFY-ROUTE: layer=%d pos=%d idx=%s\n", layer, pos_, fmt_idx(idx).c_str());
+    // RACE-DIAG-LOC: env-gated sleep at the HEAD of route() -- right after the idx
+    // read and BEFORE the sentinel check, bounds check, moe2_apply, and sync. Gated
+    // on OFLM_ROUTE_HEAD_SYNC_US so it can be toggled independently of the tail
+    // sleep (OFLM_ROUTE_TAIL_SYNC_US, below). Both off by default. Delete once
+    // diagnosed.
+    if (const char* e = std::getenv("OFLM_ROUTE_HEAD_SYNC_US")) {
+        const unsigned us = static_cast<unsigned>(std::strtoul(e, nullptr, 10));
+        if (us) std::this_thread::sleep_for(std::chrono::microseconds(us));
+    }
     // OPEN-REQUEST-ISOLATION. The wait on this layer's first dispatch returning is NOT
     // enough for the host to see the router record it wrote: roughly one read in 3000 (in
     // the periods where it happens at all) still returns the PREVIOUS step's idx, and a
@@ -1783,6 +1799,14 @@ void Core::route(Kern& k, int layer, uint64_t act_off) {
         if (idx[s] >= w_->moe.experts) throw std::runtime_error("open_qwen36: router produced expert index " + std::to_string(idx[s]));
     stream_patch::moe2_apply(k.iw(), k.moe2, idx, w_->moe);
     k.instr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    // RACE-DIAG: env-gated sleep at the TAIL of route() -- after moe2_apply and the
+    // instruction-BO sync, before route() returns and lx1 is dispatched. Gated on
+    // OFLM_ROUTE_TAIL_SYNC_US so it can be toggled independently of the head sleep
+    // (OFLM_ROUTE_HEAD_SYNC_US, above). Both off by default. Delete once diagnosed.
+    if (const char* e = std::getenv("OFLM_ROUTE_TAIL_SYNC_US")) {
+        const unsigned us = static_cast<unsigned>(std::strtoul(e, nullptr, 10));
+        if (us) std::this_thread::sleep_for(std::chrono::microseconds(us));
+    }
     timing_.route_ms += ms_since(t0);
 }
 
@@ -1863,7 +1887,11 @@ void Core::step_impl(int token, const float* x, bool want_logits, const int64_t*
         std::memcpy(xres.map<float*>(), x, w_->hidden * 4);
     else
         embedding_row(static_cast<size_t>(token), xres.map<float*>());
-    if (cfg_.verbose && !x) {
+    // STEP-LOG: was gated on cfg_.verbose, which --quiet does not clear in this build,
+    // so every token printed a line even in quiet mode. Now opt-in via OFLM_OPEN_STEP_LOG
+    // so the per-token diagnostics are off by default and can be turned back on for a
+    // debug run without changing anything else.
+    if (std::getenv("OFLM_OPEN_STEP_LOG") && !x) {
         const float* e = xres.map<float*>();
         int nnan = 0;
         float mx = 0.f;
@@ -2113,7 +2141,8 @@ void Core::step_impl(int token, const float* x, bool want_logits, const int64_t*
         }
     }
     if (want_logits) {
-        if (cfg_.verbose) {
+        // STEP-LOG: same opt-in env gate as the embed line above; was cfg_.verbose.
+        if (std::getenv("OFLM_OPEN_STEP_LOG")) {
             xres.sync(XCL_BO_SYNC_BO_FROM_DEVICE, w_->hidden * 4, 0);
             const float* x = xres.map<float*>();
             int nnan = 0;

@@ -455,9 +455,16 @@ std::string Qwen3_6_MOE::generate_with_prompt(chat_meta_info_t& meta_info, lm_un
     if (!this->insert(meta_info, input, is_cancelled)) {
         return "";
     }
+    // VERIFY-MODEL markers: these are deliberately distinctive strings so `findstr
+    // /C:"VERIFY-MODEL" oflm.exe` proves this patch was compiled into the running
+    // binary. Delete once the cached-continuation hang is diagnosed.
+    std::fprintf(stderr, "[VERIFY-MODEL] generate_with_prompt entered after insert (token_history=%zu, total_tokens=%d)\n",
+                 this->token_history.size(), this->total_tokens);
     header_print("OFLM", "Prompt inserted, starting generation...");
     int checkpoint_idx = this->lm_engine->checkpoint();
+    std::fprintf(stderr, "[VERIFY-MODEL] checkpoint() returned %d\n", checkpoint_idx);
     int restore_idx = this->lm_engine->restore();
+    std::fprintf(stderr, "[VERIFY-MODEL] restore() returned %d\n", restore_idx);
     header_print_r("OFLM", "Checkpoint before generation: " << checkpoint_idx << ", restore point: " << restore_idx << ", user context length: " << this->token_history.size());
     if (this->enable_think) {
         os << "<think>\n" << std::flush;
