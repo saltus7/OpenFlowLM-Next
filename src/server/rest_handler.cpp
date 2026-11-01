@@ -904,7 +904,6 @@ void RestHandler::handle_generate(const json& request,
         std::string model = request.value("model", current_model_tag);
         json options = request.value("options", json::object());
        
-        int length_limit = request.value("max_tokens", 4096);
         auto load_start_time = time_utils::now();
         // TODO: Use Another Check Function avoid loading again
         if (const ModelLoad why = ensure_model_loaded(model, request.contains("model")); why != ModelLoad::Ok) {
@@ -912,6 +911,11 @@ void RestHandler::handle_generate(const json& request,
             return;
         }
         auto load_end_time = time_utils::now();
+
+        // Default output budget = 80% of the loaded model's context window.
+        const int default_max_output =
+            static_cast<int>(this->auto_chat_engine->get_max_length() * 0.8);
+        const int length_limit = request.value("max_tokens", default_max_output);
       
         chat_meta_info_t meta_info;
         lm_uniform_input_t uniformed_input;
@@ -1062,14 +1066,17 @@ void RestHandler::handle_chat(const json& request,
         bool stream = request.value("stream", false);
         std::string model = request.value("model", current_model_tag);
         json options = request.value("options", json::object());
-        int length_limit = options.value("num_predict", 4096);
-
         auto load_start_time = time_utils::now();
         if (const ModelLoad why = ensure_model_loaded(model, request.contains("model")); why != ModelLoad::Ok) {
             send_response(openai_compat::model_error(why, model));
             return;
         }
         auto load_end_time = time_utils::now();
+
+        // Default output budget = 80% of the loaded model's context window.
+        const int default_max_output =
+            static_cast<int>(this->auto_chat_engine->get_max_length() * 0.8);
+        const int length_limit = options.value("num_predict", default_max_output);
        
         configure_chat_engine_parameters(options, request);
 
@@ -1717,7 +1724,6 @@ void RestHandler::handle_openai_chat_completion(const json& request,
         json current_messages = request["messages"];
         std::string model = request.value("model", current_model_tag);
         bool stream = request.value("stream", false);
-        int length_limit = request.value("max_tokens", request.value("max_completion_tokens", 4096));
         json tools = request.value("tools", json::array());
         json options = request.value("options", json::object());
 
@@ -1727,6 +1733,11 @@ void RestHandler::handle_openai_chat_completion(const json& request,
             return;
         }
         auto load_end_time = time_utils::now();
+
+        // Default output budget = 80% of the loaded model's context window.
+        const int default_max_output =
+            static_cast<int>(this->auto_chat_engine->get_max_length() * 0.8);
+        const int length_limit = request.value("max_tokens", request.value("max_completion_tokens", default_max_output));
 
         configure_chat_engine_parameters(options, request);
 
@@ -2039,12 +2050,15 @@ void RestHandler::handle_openai_completion(const json& request,
         // into a generic server_error. ensure_model_loaded() asks the same question
         // and answers it properly.
 
-        int length_limit = request.value("max_tokens", 4096);
-
-         if (const ModelLoad why = ensure_model_loaded(model, request.contains("model")); why != ModelLoad::Ok) {
+        if (const ModelLoad why = ensure_model_loaded(model, request.contains("model")); why != ModelLoad::Ok) {
             send_response(openai_compat::model_error(why, model));
             return;
         }
+
+        // Default output budget = 80% of the loaded model's context window.
+        const int default_max_output =
+            static_cast<int>(this->auto_chat_engine->get_max_length() * 0.8);
+        const int length_limit = request.value("max_tokens", default_max_output);
 
         configure_chat_engine_parameters(options, request);
 

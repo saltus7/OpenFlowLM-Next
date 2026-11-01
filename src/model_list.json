@@ -12,7 +12,7 @@
                 "size": 1000000000,
                 "oflm_min_version": "0.9.38",
                 "default_context_length": 8192,
-                "max_prefill_len": 4096,
+                "max_prefill_len":       4096,
                 "files": [
                     "config.json",
                     "model.q4nx",

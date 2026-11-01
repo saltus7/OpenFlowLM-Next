@@ -621,7 +621,13 @@ LN = HERE.parent / "ln"
 LINL = HERE.parent / "lin_layer"
 RT = HERE.parent / "router"
 W_ELEMS = C.W_ELEMS                   # router W as elements of 4 KB
-
+# The router header's kE is now MB_EXPERTS (the routed-expert count), not a hard-coded
+# 256: its write offsets stay pinned to bytes 1024 / 1056 (the manifest's rout_idx_off),
+# but the acc loop's width, the W row stride and the top-8 search bound all follow kE.
+# Passing the define here is the ONLY way aiecc sees it -- router.h has an #error guard,
+# so a forgotten -D fails the compile instead of mis-slicing W at 128 experts.
+ROUTER_FLAGS = [f"-DMB_EXPERTS={SPEC.num_experts}"]
+print(f"DEBUG xcommon: NE={NE!r} C.NE={C.NE!r} SPEC.num_experts={SPEC.num_experts!r} ROUTER_FLAGS={ROUTER_FLAGS!r}")
 
 # LN_N / LN_EPS default to the 27B's in ln.h and ln_nr.cc, so the MoE path compiles with
 # exactly the flags it always did; a different width or epsilon passes them.
@@ -666,9 +672,12 @@ def ln_kernels(inc, t):
     k = {}
     k["ln_nr"] = ExternalFunction("ln_nr", source_file=str(LINL / "ln_nr.cc"), arg_types=[u] * 4, include_dirs=inc)
     k["ln"] = ExternalFunction("ln_fn", source_file=str(LN / "ln.cc"), arg_types=[u] * 8, include_dirs=inc)
-    k["rcopy"] = ExternalFunction("router_copy_x", source_file=str(RT / "router_copy.cc"), arg_types=[u, t["xb"]], include_dirs=inc)
-    k["racc"] = ExternalFunction("router_acc", source_file=str(RT / "router.cc"), arg_types=[u, t["xb"], t["racc"], np.int32], include_dirs=inc)
-    k["rfin"] = ExternalFunction("router_fin", source_file=str(RT / "router_fin.cc"), arg_types=[t["racc"], u], include_dirs=inc)
+    k["rcopy"] = ExternalFunction("router_copy_x", source_file=str(RT / "router_copy.cc"), arg_types=[u, t["xb"]], include_dirs=inc,
+                                  compile_flags=ROUTER_FLAGS)
+    k["racc"] = ExternalFunction("router_acc", source_file=str(RT / "router.cc"), arg_types=[u, t["xb"], t["racc"], np.int32], include_dirs=inc,
+                                 compile_flags=ROUTER_FLAGS)
+    k["rfin"] = ExternalFunction("router_fin", source_file=str(RT / "router_fin.cc"), arg_types=[t["racc"], u], include_dirs=inc,
+                                 compile_flags=ROUTER_FLAGS)
     return k
 
 
