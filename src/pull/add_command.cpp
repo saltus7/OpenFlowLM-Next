@@ -46,7 +46,29 @@ std::filesystem::path find_bundled_script() {
     return {};
 }
 
-int spawn(const std::vector<std::string>& args) {
+#ifdef _WIN32
+// _spawnvp joins argv with spaces and does not quote, so an argument that
+// contains a space -- the bundled oflm-add.py path, or a --system-list value
+// under a directory whose name has one -- arrives at the child split apart.
+// Wrap each argument that needs it before handing it to the CRT. Embedded
+// double quotes are escaped; this covers the tags and paths this command is
+// given in practice.
+std::string quote_win32_arg(const std::string& arg) {
+    if (arg.find_first_of(" \t\"") == std::string::npos) return arg;
+    std::string out = "\"";
+    for (char c : arg) {
+        if (c == '"') out.push_back('\\');
+        out.push_back(c);
+    }
+    out.push_back('"');
+    return out;
+}
+#endif
+
+int spawn(std::vector<std::string> args) {
+#ifdef _WIN32
+    for (size_t i = 1; i < args.size(); ++i) args[i] = quote_win32_arg(args[i]);
+#endif
     std::vector<char*> raw;
     raw.reserve(args.size() + 1);
     for (const auto& arg : args) raw.push_back(const_cast<char*>(arg.c_str()));

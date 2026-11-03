@@ -70,15 +70,70 @@ Builder find_builder() {
     return b;
 }
 
+#ifdef _WIN32
+// _spawnvp on Windows joins argv with spaces and does not quote, so any
+// argument that contains a space arrives at the child split apart. The `-c`
+// script below is one long string with spaces, which is how the child python
+// ended up seeing the single word "import" as its script and failing with
+// "Expected one or more names after 'import'". Quote each argument per
+// CommandLineToArgvW rules before handing it to the CRT so the child
+// reconstructs the same argv we built here.
+std::string quote_win32_arg(const std::string& arg) {
+    if (arg.empty()) return "\"\"";
+    bool needs_quotes = false;
+    for (char c : arg) {
+        if (c == ' ' || c == '\t' || c == '"') { needs_quotes = true; break; }
+    }
+    if (!needs_quotes) return arg;
+
+    std::string out;
+    out.reserve(arg.size() + 2);
+    out.push_back('"');
+    size_t backslashes = 0;
+    for (char c : arg) {
+        if (c == '\\') {
+            ++backslashes;
+        } else if (c == '"') {
+            // Backslashes that precede a quote must be doubled; the quote
+            // itself must be escaped with a backslash.
+            out.append(backslashes * 2 + 1, '\\');
+            out.push_back('"');
+            backslashes = 0;
+        } else {
+            out.append(backslashes, '\\');
+            backslashes = 0;
+            out.push_back(c);
+        }
+    }
+    // Backslashes that precede the closing quote must be doubled so they are
+    // not mistaken for escaping the closing quote.
+    out.append(backslashes * 2, '\\');
+    out.push_back('"');
+    return out;
+}
+#endif
+
 int spawn(const std::vector<std::string>& args) {
+#ifdef _WIN32
+    // argv[0] is the program path the CRT resolves; every remaining element
+    // must be pre-quoted or it splits at the first space.
+    std::vector<std::string> quoted;
+    quoted.reserve(args.size());
+    if (!args.empty()) quoted.push_back(args[0]);
+    for (size_t i = 1; i < args.size(); ++i) {
+        quoted.push_back(quote_win32_arg(args[i]));
+    }
+    std::vector<char*> raw;
+    raw.reserve(quoted.size() + 1);
+    for (auto& q : quoted) raw.push_back(const_cast<char*>(q.c_str()));
+    raw.push_back(nullptr);
+    const intptr_t rc = _spawnvp(_P_WAIT, raw[0], raw.data());
+    return rc == -1 ? 1 : static_cast<int>(rc);
+#else
     std::vector<char*> raw;
     raw.reserve(args.size() + 1);
     for (const auto& arg : args) raw.push_back(const_cast<char*>(arg.c_str()));
     raw.push_back(nullptr);
-#ifdef _WIN32
-    const intptr_t rc = _spawnvp(_P_WAIT, raw[0], raw.data());
-    return rc == -1 ? 1 : static_cast<int>(rc);
-#else
     execvp(raw[0], raw.data());
     std::cerr << "Error: could not start " << args[0] << ": "
               << std::strerror(errno) << std::endl;

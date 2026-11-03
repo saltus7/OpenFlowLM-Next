@@ -125,6 +125,13 @@ typedef bfloat16 kvout_t;
 // IEEE round-to-nearest-even results bit for bit (utilities/scalar_fp_test.cpp), ~1.8 KB
 // less program memory. On with the block-only path, the one core that needs the room;
 // 0 = the path every other family compiles, byte for byte.
+//
+// Was TRIED on the KV-quant path and is OFF for it (2026-11-02, Qwen3-4B, HD 128,
+// NHL=8, RB=1, KV_QUANT=q4_0): .text GREW by 656 B, 18048 -> 18704. The 35B's ~1.8 KB
+// saving was measured on the block-only core (HD 256, NHL=4, ATTN_BLOCK_ONLY=1) where
+// the compiler-rt scalar float routines dominate; on this core they do not, so INTFP
+// only adds the scalar_fp bodies without removing meaningful compiler-rt code. Kept
+// OFF; scalar_fp.h is still linked when ATTN_BLOCK_ONLY pulls it in.
 #define ATTN_INTFP ATTN_BLOCK_ONLY
 #endif
 #if ATTN_INTFP
@@ -205,10 +212,35 @@ static constexpr unsigned kNL = kNHL >= 8 ? kNHL : 8;
 // fully at HD <= 128. At HD 256 the fully unrolled score and V loops overflowed the core's
 // 16 KB of program memory (Gemma3-4B, 2026-09-08: "Overflow of program memory", at RB 4
 // and at RB 2), so there they unroll by four. HD 64 / 128 compile what they compiled.
-#if ATTN_HD <= 128
-#define ATTN_UNROLL_HD AIE_LOOP_UNROLL_FULL
-#else
+#if ATTN_HD > 128
 #define ATTN_UNROLL_HD _Pragma("clang loop unroll_count(4)")
+#elif defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1) || defined(KV_QUANT_Q4_0)
+// On a quantised KV cache, attn_row_impl's value phase duplicates its j-loop body
+// once per grew_i[hl] arm, so at HD 128 the bf16 FULL unroll (kNHL x 4 mac bodies
+// per phase) becomes kNHL x 4 x 2 -- at Qwen3-4B's kNHL = 8, 96 bodies per call vs
+// the 64 the bf16 build already carries at 14.5 KB. unroll_count(2) halves both
+// phases (kNHL x 2 per arm) and puts the quantised build under the bf16 baseline.
+// bf16 keeps AIE_LOOP_UNROLL_FULL byte-for-byte, and HD 256 above keeps its own
+// unroll_count(4) (the 35B's geometry is unchanged by this branch).
+#define ATTN_UNROLL_HD _Pragma("clang loop unroll(disable)")
+#else
+#define ATTN_UNROLL_HD AIE_LOOP_UNROLL_FULL
+#endif
+#if defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1) || defined(KV_QUANT_Q4_0)
+// Head-loop and fin-loop unroll for the KV-quantised path. Disabled: the bf16 build
+// fits at 14.5 KB with the head loop fully unrolled and the inner j-loop FULL (HD
+// <= 128), but the quantised path duplicates every value-phase j-body once for the
+// grew_i branch and adds the dequant call sites on top, which pushed the Qwen3-4B
+// attention core over 16 KB. Turning off both the head loop and the remaining
+// unroll inside it, plus the same on the fin/q/k/v head loops below, reclaims the
+// margin at a throughput cost we take for now. bf16 expands ATTN_UNROLL_HEAD to
+// AIE_LOOP_UNROLL_FULL and ATTN_UNROLL_KVQ to nothing, so its compiled output is
+// unchanged.
+#define ATTN_UNROLL_HEAD _Pragma("clang loop unroll(disable)")
+#define ATTN_UNROLL_KVQ _Pragma("clang loop unroll(disable)")
+#else
+#define ATTN_UNROLL_HEAD AIE_LOOP_UNROLL_FULL
+#define ATTN_UNROLL_KVQ
 #endif
 static constexpr unsigned kPV = kRB * kNL;    // the block's score vector: one exp covers it all
 // Heads in one og element. Until attention could be split more finely than the og
@@ -522,8 +554,14 @@ static constexpr unsigned kKVHeadBytes = kKVNBlk * kKVBlockBytes;
 // noinline so the body appears ONCE in the linked program (called from both attn_k_impl
 // and attn_v_impl); with the outer loop also un-unrolled, its footprint drops from
 // ~4 x 4 = 16 inline copies of the 4-block body to 1 copy plus loop counter.
-__attribute__((noinline))
-static void quant_kv_row(const float *__restrict src, kvout_t *__restrict dst) {
+// Was `static`: static linkage gives one copy per translation unit, and this function is
+// called from BOTH attn_k_impl (attn_k.cc) and attn_v_impl (attn_v.cc), so the ELF carried
+// two 1024 B copies of it (verified 2026-11-02 with llvm-nm on the failing Qwen3-4B
+// attention core, elfs_main_core_2_3.elf, `t _ZL12quant_kv_rowPKfPh` at 0x11e0 and 0x16c0).
+// `inline` + noinline keeps the single-copy promise the comment above describes: external
+// linkage, no per-call-site duplication, linker folds to one. bf16 builds do not reach
+// this code (it is inside the KV-quant #if region) and stay byte-for-byte unchanged.
+__attribute__((noinline)) inline void quant_kv_row(const float *__restrict src, kvout_t *__restrict dst) {
     #pragma unroll 1
     for (unsigned bi = 0; bi < kKVNBlk; ++bi) {
         // Force a hard address computation the compiler cannot fold
@@ -590,7 +628,7 @@ static void quant_kv_row(const float *__restrict src, kvout_t *__restrict dst) {
     }
 }
 
-static inline void dequant_kv_block(const kvout_t *__restrict row, unsigned bi,
+__attribute__((noinline)) inline void dequant_kv_block(const kvout_t *__restrict row, unsigned bi,
                                      bfloat16 *__restrict dst) {
     // Inner loops un-rolled on purpose: without these pragmas Clang auto-unrolls the
     // 32-value loop below, which, multiplied by 4 blocks a row and 8 call sites in
@@ -650,7 +688,7 @@ static inline void dequant_kv_block(const kvout_t *__restrict row, unsigned bi,
 // it is called for. On Nanbeige's kNHL*kRB path that is a ~16x reduction in
 // the binary size of the dequant block -- the difference between fitting a
 // core's 16 KB of program memory and overflowing it.
-__attribute__((noinline)) static void dequant_kv_row(const kvout_t *__restrict src, bfloat16 *__restrict dst) {
+__attribute__((noinline)) inline void dequant_kv_row(const kvout_t *__restrict src, bfloat16 *__restrict dst) {
   #pragma unroll 1
   for (unsigned bi = 0; bi < kKVNBlk; ++bi) dequant_kv_block(src, bi, dst + bi * 32);
 }
@@ -669,6 +707,7 @@ static inline void attn_k_impl(const float *__restrict ke ATTN_BIAS_PARM, const 
   const float *__restrict ksrc = ke;
 #endif
 #if defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1) || defined(KV_QUANT_Q4_0)
+  ATTN_UNROLL_KVQ
   for (unsigned i = 0; i < kHPE; ++i) {
     norm_rope(ksrc + i * kHD, kn, cs, tmp);
     quant_kv_row(tmp, kout + (e * kHPE + i) * kKVHeadBytes);
@@ -690,6 +729,7 @@ static inline void attn_v_impl(const float *__restrict ve ATTN_BIAS_PARM, kvout_
   const float *__restrict vsrc = ve;
 #endif
 #if defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1) || defined(KV_QUANT_Q4_0)
+  ATTN_UNROLL_KVQ
   for (unsigned i = 0; i < kHPE; ++i) quant_kv_row(vsrc + i * kHD, vout + (e * kHPE + i) * kKVHeadBytes);
 #else
   for (unsigned i = 0; i < kHPE; ++i) to_bf16_hd(vsrc + i * kHD, vout + (e * kHPE + i) * kHD);
@@ -759,7 +799,7 @@ __attribute__((noinline)) inline void attn_row_impl(const kvout_t *__restrict Kt
   // handful of rows that do not fill a block, and the 8x of code it costs is
   // 8x of the core's 16 KB of program memory that the block kernel needs.
 #if ATTN_RB == 1 && ATTN_HD <= 128
-  AIE_LOOP_UNROLL_FULL      // at HD 256 four heads unrolled over eight head-dim steps overflow
+  ATTN_UNROLL_HEAD          // at HD 256 four heads unrolled over eight head-dim steps overflow
 #endif                      // program memory (the 35B's ax, 2026-09-08); the loop stays a loop there
   for (unsigned hl = 0; hl < kNHL; ++hl) {
     const unsigned h = kSplit ? ((unsigned)h0 + hl) : hl;   // folds away when this core owns them all                 // global head: q and the kv mapping
@@ -834,8 +874,14 @@ __attribute__((noinline)) inline void attn_row_impl(const kvout_t *__restrict Kt
   // Unrolled only when this is the hot path. With ATTN_RB > 1 it runs for the
   // handful of rows that do not fill a block, and the 8x of code it costs is
   // 8x of the core's 16 KB of program memory that the block kernel needs.
+  //
+  // Uses ATTN_UNROLL_HEAD (not AIE_LOOP_UNROLL_FULL) to match the score phase
+  // above: the earlier pass that was supposed to disable both phases caught the
+  // score phase's text first, so this one kept its FULL unroll on KV_QUANT and
+  // left ~1 KB of the 17072 B .text on the table. bf16 is unchanged either way
+  // (both macros expand to AIE_LOOP_UNROLL_FULL outside the KV-quant #if).
 #if ATTN_RB == 1 && ATTN_HD <= 128
-  AIE_LOOP_UNROLL_FULL      // at HD 256 four heads unrolled over eight head-dim steps overflow
+  ATTN_UNROLL_HEAD          // at HD 256 four heads unrolled over eight head-dim steps overflow
 #endif                      // program memory (the 35B's ax, 2026-09-08); the loop stays a loop there
   for (unsigned hl = 0; hl < kNHL; ++hl) {
     const unsigned kvh = (kSplit ? ((unsigned)h0 + hl) : hl) / (kNH / kKVH);
@@ -847,6 +893,27 @@ __attribute__((noinline)) inline void attn_row_impl(const kvout_t *__restrict Kt
 #else
     const bfloat16 *v = Vt + kvh * kHD;
 #endif
+#if defined(KV_QUANT_Q8) || defined(KV_QUANT_Q4_1) || defined(KV_QUANT_Q4_0)
+    // On the KV-quantised path the grew_i branch is retired: always rescale. The
+    // branch existed to skip a fscaleN when a position did not raise the head's
+    // running max -- common on long contexts, rare on short -- but its two arms
+    // cost one extra j-loop body in program memory, and this core (Qwen3-4B,
+    // HD 128, NHL 8, RB 1, KV_QUANT=q4_0) is ~688 B over 16 KB of program memory
+    // (2026-11-02, .text 17072 B on elfs_main_core_2_3.elf). Always rescale is
+    // bit-identical to the else arm below; the only loss is the no-rescale fast
+    // path at runtime, which we take until the design fits. bf16 keeps the
+    // original branch, byte-for-byte, via the #else.
+    const bfloat16 ahh = ah[hl], all = al[hl];
+    ATTN_UNROLL_HD
+    for (unsigned j = 0; j < kHD; j += kV) {
+      accf32 acc = aie::zeros<accfloat, kV>();
+      acc = mac_vs<kV>(acc, aie::load_v<kV>(o + j), ahh, all);
+      const vbN<kV> vj = aie::load_v<kV>(v + j);
+      acc = aie::mac(acc, vj, bhh);
+      acc = aie::mac(acc, vj, bll);
+      aie::store_v(o + j, acc.template to_vector<float>());
+    }
+#else
     // a is exp(m_old - m_new), so it is exactly 1 unless THIS position raised the
     // head's running max -- which over a long context happens O(log P) times, not
     // P. The rescale is not merely a multiply by one either: fscaleN splits o into
@@ -878,6 +945,7 @@ __attribute__((noinline)) inline void attn_row_impl(const kvout_t *__restrict Kt
         aie::store_v(o + j, acc.template to_vector<float>());
       }
     }
+#endif
   }
 }
 #else

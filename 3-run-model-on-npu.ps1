@@ -27,10 +27,13 @@ cd C:/Users/user/lyb-llm-host/projects/OpenFlowLM-Next
 # 5. CHOOSE MODEL AND RUN
 
 # ornith1.5:9b
-# ./build-vs18/src/oflm.exe serve ornith1.5:9b --host 10.0.10.10 --port 52625 --ctx-len 262144 --pmode turbo --quiet
+# ./build-vs18/src/oflm.exe serve ornith1.5:9b --host 10.0.10.10 --port 52625 --ctx-len 262144 --pmode turbo --quiet --preemption 1 --prefill-chunk-len 1024
 
 # qwen3.8:9b
-./build-vs18/src/oflm.exe serve qwen3.8:9b --host 10.0.10.10 --port 52625 --ctx-len 262144 --pmode turbo
+# ./build-vs18/src/oflm.exe serve qwen3.8:9b --host 10.0.10.10 --port 52625 --ctx-len 262144 --pmode turbo
 
 # groot:19b
 # ./build-vs18/src/oflm.exe serve groot:19b --host 10.0.10.10 --port 52625 --ctx-len 32768 --pmode turbo --prefill-mode fast
+
+# lyb.lfm2:2.6b
+./build-vs18/src/oflm.exe serve lyb.lfm2:2.6b --host 10.0.10.10 --port 52625 --ctx-len 128000 --pmode turbo --quiet --preemption 1 --prefill-chunk-len 1024

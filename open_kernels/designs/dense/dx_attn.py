@@ -99,6 +99,11 @@ elif KV_QUANT == "q4_1":
     ATTN_FLAGS.append("-DKV_QUANT_Q4_1=1")
 elif KV_QUANT == "q4_0":
     ATTN_FLAGS.append("-DKV_QUANT_Q4_0=1")
+# -Oz was tried here and in dx.py; it made .text 832 B LARGER on Qwen3-4B
+# (18048 -> 18880, 2026-11-02). Reverted. The experiment now is -O2 -- see dx.py's
+# identical comment. bf16 is unaffected either way.
+if KV_QUANT != "bf16":
+    ATTN_FLAGS.append("-O2")
 for _k, _v in QR.probe_env().items():               # ATTN_NULL / ATTN_ABL, same as dx.py
     if _k != "ATTN_RB":
         ATTN_FLAGS.append(f"-D{_k}={_v}")

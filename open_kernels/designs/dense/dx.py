@@ -175,6 +175,18 @@ elif KV_QUANT == "q4_1":
     ATTN_FLAGS.append("-DKV_QUANT_Q4_1=1")
 elif KV_QUANT == "q4_0":
     ATTN_FLAGS.append("-DKV_QUANT_Q4_0=1")
+# The attention TUs are compiled with ATTN_FLAGS, which is -D defines only -- the
+# `ef(..., flags=OS)` default of -Os is REPLACED, not appended to, when a caller
+# supplies flags. So aiecc's default optimization level applies to every attention
+# TU. Two flags were tried on this path and MEASURED (2026-11-02, Qwen3-4B, .text of
+# elfs_main_core_2_3.elf): -Oz added 832 B (18048 -> 18880), and INTFP added 656 B
+# (18048 -> 18704). Both were losses; the -D-only flag set is currently in force
+# (17072 B after quant_kv_row dedupe). -O2 is the next experiment: it enables
+# aggressive DCE and register allocation that -Oz apparently does not on this
+# compiler, and it is trivially revertible if it turns out to be a loss too. Only
+# on the KV-quant path -- bf16 keeps the -D-only flags byte-for-byte.
+if KV_QUANT != "bf16":
+    ATTN_FLAGS.append("-O2")
 OGH = min(NHL, G.HPO)                                  # heads in one og element (attn.h's kOGH)
 N_OG = NHL // OGH                                      # og elements a core emits
 LN_FLAGS = [f"-DLN_N={HID}", f"-DLN_EPS={G.EPS:g}f"]
